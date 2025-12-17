@@ -190,11 +190,13 @@ pub const ScriptLine = struct {
 /// Registry of all tasks parsed from the Zakefile
 pub const TaskRegistry = struct {
     tasks: ArrayList(Task),
+    global_vars: std.StringHashMap([]const u8),
     allocator: Allocator,
 
     pub fn init(allocator: Allocator) TaskRegistry {
         return TaskRegistry{
             .tasks = .empty,
+            .global_vars = std.StringHashMap([]const u8).init(allocator),
             .allocator = allocator,
         };
     }
@@ -204,10 +206,25 @@ pub const TaskRegistry = struct {
             task.deinit();
         }
         self.tasks.deinit(self.allocator);
+
+        // Free global vars
+        var iter = self.global_vars.iterator();
+        while (iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.global_vars.deinit();
     }
 
     pub fn addTask(self: *TaskRegistry, task_to_add: Task) !void {
         try self.tasks.append(self.allocator, task_to_add);
+    }
+
+    pub fn addGlobalVar(self: *TaskRegistry, name: []const u8, value: []const u8) !void {
+        const key_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(key_copy);
+        const value_copy = try self.allocator.dupe(u8, value);
+        try self.global_vars.put(key_copy, value_copy);
     }
 
     /// Find a task by name. If multiple tasks with the same name exist
@@ -244,6 +261,38 @@ pub const TaskRegistry = struct {
         }
 
         // Priority: exact > unix > any
+        return exact_match orelse unix_match orelse any_match;
+    }
+
+    /// Find a task by name (const version)
+    pub fn findTaskConst(self: *const TaskRegistry, name: []const u8) ?*const Task {
+        const builtin = @import("builtin");
+        const current_os = builtin.os.tag;
+
+        var exact_match: ?*const Task = null;
+        var unix_match: ?*const Task = null;
+        var any_match: ?*const Task = null;
+
+        for (self.tasks.items) |*t| {
+            if (std.mem.eql(u8, t.name, name)) {
+                switch (t.target_os) {
+                    .any => any_match = t,
+                    .linux => if (current_os == .linux) {
+                        exact_match = t;
+                    },
+                    .windows => if (current_os == .windows) {
+                        exact_match = t;
+                    },
+                    .macos, .darwin => if (current_os == .macos) {
+                        exact_match = t;
+                    },
+                    .unix => if (current_os != .windows) {
+                        unix_match = t;
+                    },
+                }
+            }
+        }
+
         return exact_match orelse unix_match orelse any_match;
     }
 

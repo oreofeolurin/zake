@@ -112,10 +112,19 @@ pub fn main() !void {
         vars.deinit();
     }
 
+    // Add global vars from Zakefile
+    var global_iter = registry.global_vars.iterator();
+    while (global_iter.next()) |entry| {
+        const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(key_copy);
+        const value_copy = try allocator.dupe(u8, entry.value_ptr.*);
+        try vars.put(key_copy, value_copy);
+    }
+
     try parseTaskArgs(allocator, task, remaining_args, &vars);
 
-    // Execute the task
-    const exit_code = executor_mod.executeTask(allocator, task, vars) catch |err| {
+    // Execute the task (with registry for 'run' command support)
+    const exit_code = executor_mod.executeTaskWithRegistry(allocator, task, vars, &registry) catch |err| {
         util.printError("Task execution failed: {s}", .{@errorName(err)});
         std.process.exit(1);
     };

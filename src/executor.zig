@@ -4,6 +4,7 @@ const util = @import("util.zig");
 const Task = task_mod.Task;
 const ScriptLine = task_mod.ScriptLine;
 const TargetOS = task_mod.TargetOS;
+const TaskRegistry = task_mod.TaskRegistry;
 const ArrayList = std.ArrayList;
 const Allocator = std.mem.Allocator;
 const StringHashMap = std.StringHashMap;
@@ -11,6 +12,9 @@ const builtin = @import("builtin");
 
 /// Variable map for substitution
 pub const VarMap = StringHashMap([]const u8);
+
+/// Maximum recursion depth for task invocations
+const MAX_RECURSION_DEPTH = 32;
 
 /// Check if a task should execute on the current OS based on its arch: directive
 pub fn shouldExecuteOnCurrentOS(target: TargetOS) bool {
@@ -25,10 +29,170 @@ pub fn shouldExecuteOnCurrentOS(target: TargetOS) bool {
 }
 
 /// Execute a task with given variable bindings
+/// registry is optional - only needed if task uses 'run' command
 pub fn executeTask(allocator: Allocator, task_ptr: *const Task, vars: VarMap) !u8 {
+    return executeTaskInternal(allocator, task_ptr, vars, null, 0);
+}
+
+/// Execute a task with registry (allows 'run' command)
+pub fn executeTaskWithRegistry(allocator: Allocator, task_ptr: *const Task, vars: VarMap, registry: *const TaskRegistry) !u8 {
+    return executeTaskInternal(allocator, task_ptr, vars, registry, 0);
+}
+
+/// Internal task execution with recursion tracking
+fn executeTaskInternal(
+    allocator: Allocator,
+    task_ptr: *const Task,
+    vars: VarMap,
+    registry: ?*const TaskRegistry,
+    depth: usize,
+) !u8 {
+    if (depth >= MAX_RECURSION_DEPTH) {
+        util.printError("Maximum task recursion depth ({d}) exceeded", .{MAX_RECURSION_DEPTH});
+        return error.RecursionLimitExceeded;
+    }
+
+    // Create a mutable copy of vars for let statements
+    var local_vars = VarMap.init(allocator);
+    defer {
+        var iter = local_vars.iterator();
+        while (iter.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        local_vars.deinit();
+    }
+
+    // Copy incoming vars to local_vars
+    var incoming_iter = vars.iterator();
+    while (incoming_iter.next()) |entry| {
+        const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(key_copy);
+        const value_copy = try allocator.dupe(u8, entry.value_ptr.*);
+        try local_vars.put(key_copy, value_copy);
+    }
+
     for (task_ptr.script_lines.items) |script_line| {
-        // Substitute variables in the command
-        const substituted = try substituteVariables(allocator, script_line.content, vars);
+        const content = script_line.content;
+
+        // Check for "let varname = value" statement
+        if (std.mem.startsWith(u8, content, "let ")) {
+            const rest = content[4..]; // Skip "let "
+
+            // Find the equals sign
+            const eq_pos = std.mem.indexOf(u8, rest, "=") orelse {
+                util.printError("Invalid let statement: missing '=' in '{s}'", .{content});
+                return error.InvalidLetStatement;
+            };
+
+            // Extract variable name (trim whitespace)
+            const var_name = std.mem.trim(u8, rest[0..eq_pos], " \t");
+            if (var_name.len == 0) {
+                util.printError("Invalid let statement: empty variable name", .{});
+                return error.InvalidLetStatement;
+            }
+
+            // Extract value (trim whitespace)
+            const raw_value = std.mem.trim(u8, rest[eq_pos + 1 ..], " \t");
+
+            // Substitute variables in the value
+            const substituted_value = try substituteVariables(allocator, raw_value, local_vars);
+
+            // Store in local_vars (overwrite if exists)
+            const key_copy = try allocator.dupe(u8, var_name);
+            errdefer allocator.free(key_copy);
+
+            // Remove old entry if exists
+            if (local_vars.fetchRemove(var_name)) |old| {
+                allocator.free(old.key);
+                allocator.free(old.value);
+            }
+
+            try local_vars.put(key_copy, substituted_value);
+            continue;
+        }
+
+        // Check for "run taskname [args...]" statement
+        if (std.mem.startsWith(u8, content, "run ")) {
+            if (registry == null) {
+                util.printError("Cannot use 'run' command: no task registry available", .{});
+                return error.NoRegistryForRun;
+            }
+
+            const rest = std.mem.trim(u8, content[4..], " \t"); // Skip "run "
+
+            // Parse task name and arguments
+            var parts = std.mem.splitScalar(u8, rest, ' ');
+            const task_name = parts.next() orelse {
+                util.printError("Invalid run statement: missing task name", .{});
+                return error.InvalidRunStatement;
+            };
+
+            // Find the target task
+            const target_task = registry.?.findTaskConst(task_name) orelse {
+                util.printError("run: task '{s}' not found", .{task_name});
+                return error.TaskNotFound;
+            };
+
+            // Build vars for the target task
+            var run_vars = VarMap.init(allocator);
+            defer {
+                var iter = run_vars.iterator();
+                while (iter.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    allocator.free(entry.value_ptr.*);
+                }
+                run_vars.deinit();
+            }
+
+            // Collect positional arguments
+            var arg_idx: usize = 0;
+            while (parts.next()) |part| {
+                const trimmed_part = std.mem.trim(u8, part, " \t");
+                if (trimmed_part.len == 0) continue;
+
+                // Check for --flag=value or --flag value
+                if (std.mem.startsWith(u8, trimmed_part, "--")) {
+                    // Parse flag
+                    const flag_part = trimmed_part[2..];
+                    if (std.mem.indexOf(u8, flag_part, "=")) |eq_idx| {
+                        const flag_name = flag_part[0..eq_idx];
+                        const flag_value = flag_part[eq_idx + 1 ..];
+                        const key_copy = try allocator.dupe(u8, flag_name);
+                        const val_copy = try allocator.dupe(u8, flag_value);
+                        try run_vars.put(key_copy, val_copy);
+                    }
+                } else {
+                    // Positional argument - map to task's argument by index
+                    if (arg_idx < target_task.arguments.items.len) {
+                        const arg_def = target_task.arguments.items[arg_idx];
+                        const key_copy = try allocator.dupe(u8, arg_def.name);
+                        const val_copy = try allocator.dupe(u8, trimmed_part);
+                        try run_vars.put(key_copy, val_copy);
+                    }
+                    arg_idx += 1;
+                }
+            }
+
+            // Apply default flag values
+            for (target_task.flags.items) |flag| {
+                if (run_vars.get(flag.long_name) == null) {
+                    const key_copy = try allocator.dupe(u8, flag.long_name);
+                    const val_copy = try allocator.dupe(u8, flag.default_value);
+                    try run_vars.put(key_copy, val_copy);
+                }
+            }
+
+            // Execute the target task recursively
+            const code = try executeTaskInternal(allocator, target_task, run_vars, registry, depth + 1);
+            if (code != 0) {
+                return code;
+            }
+            continue;
+        }
+
+        // Regular command - substitute variables
+        const substituted = try substituteVariables(allocator, content, local_vars);
         defer allocator.free(substituted);
 
         // Execute the command

@@ -15,6 +15,7 @@ const ParserState = enum {
     TopLevel, // Outside any task
     InTaskDefinition, // Inside task, before script:
     InScript, // Inside script: block
+    InVars, // Inside vars: block
 };
 
 /// Parser for Zakefile
@@ -77,6 +78,26 @@ pub const Parser = struct {
             return;
         }
 
+        // Check for vars: block (top-level only)
+        if (!isIndented(line) and std.mem.eql(u8, trimmed, "vars:")) {
+            self.state = .InVars;
+            self.current_task = null; // Exit any current task
+            return;
+        }
+
+        // Handle vars: block content
+        if (self.state == .InVars) {
+            if (!isIndented(line)) {
+                // Non-indented line ends vars: block - reprocess as normal line
+                self.state = .TopLevel;
+                // Fall through to handle this line
+            } else {
+                // Parse variable assignment: NAME: "value" or NAME: value
+                try self.parseGlobalVar(trimmed);
+                return;
+            }
+        }
+
         // Check if this is a task definition (ends with : and not indented)
         if (!isIndented(line) and std.mem.endsWith(u8, trimmed, ":")) {
             try self.startNewTask(trimmed);
@@ -105,6 +126,35 @@ pub const Parser = struct {
             std.debug.print("Error at line {d}: Unknown directive: {s}\n", .{ self.line_number, trimmed });
             return error.UnknownDirective;
         }
+    }
+
+    /// Parse global variable in vars: block
+    /// Format: NAME: "value" or NAME: value
+    fn parseGlobalVar(self: *Parser, line: []const u8) !void {
+        // Find the colon
+        const colon_pos = std.mem.indexOf(u8, line, ":") orelse {
+            std.debug.print("Error at line {d}: Invalid variable format, expected 'NAME: value'\n", .{self.line_number});
+            return error.InvalidVarSyntax;
+        };
+
+        const var_name = std.mem.trim(u8, line[0..colon_pos], " \t");
+        if (var_name.len == 0) {
+            std.debug.print("Error at line {d}: Empty variable name\n", .{self.line_number});
+            return error.InvalidVarSyntax;
+        }
+
+        var value = std.mem.trim(u8, line[colon_pos + 1 ..], " \t");
+
+        // Strip quotes if present
+        if (value.len >= 2) {
+            if ((value[0] == '"' and value[value.len - 1] == '"') or
+                (value[0] == '\'' and value[value.len - 1] == '\''))
+            {
+                value = value[1 .. value.len - 1];
+            }
+        }
+
+        try self.registry.addGlobalVar(var_name, value);
     }
 
     /// Handle description comment (##)
