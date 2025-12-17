@@ -1,0 +1,97 @@
+# Example Zakefile for Zake Phase 1
+
+## Build the project
+build:
+    script:
+        echo "Building zake..."
+        zig build
+
+## Run the zake CLI (pass args with --args)
+run:
+    script:
+        zig build run
+
+## Run all tests
+test:
+    script:
+        echo "Running tests..."
+        zig build test
+
+## Clean build artifacts
+clean:
+    script:
+        echo "Cleaning build artifacts..."
+        rm -rf zig-out
+        rm -rf .zig-cache
+
+## Say hello to someone
+hello:
+    arg: <name> [string] "The name to greet"
+    flag: --greeting|-g [string="Hello"] "The greeting to use"
+    script:
+        echo "{{greeting}}, {{name}}!"
+
+## Deploy to environment
+deploy:
+    arg: <environment> [string] "Target environment (dev, staging, prod)"
+    arg: <version> [string?] "Version to deploy (optional)"
+    flag: --region|-r [string="us-east-1"] "AWS region"
+    flag: --verbose|-v [string="false"] "Enable verbose output"
+    script:
+        echo "Deploying to {{environment}} in region {{region}}"
+        echo "Version: {{version}}"
+        echo "Verbose: {{verbose}}"
+        @echo "This command is silent (no $ prefix shown)"
+
+## Show environment variables
+show-env:
+    script:
+        echo "User: ${USER}"
+        echo "Home: ${HOME}"
+        echo "Shell: ${SHELL}"
+
+## Test command substitution
+git-info:
+    script:
+        echo "Current directory: $(pwd)"
+        echo "Git branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'not a git repo')"
+        echo "Git commit: $(git rev-parse --short HEAD 2>/dev/null || echo 'N/A')"
+
+## Combined example with all variable types
+demo:
+    arg: <name> [string] "Your name"
+    flag: --lang|-l [string="Zig"] "Programming language"
+    script:
+        echo "Hello {{name}}!"
+        echo "You're coding in {{lang}}"
+        echo "Your username is ${USER}"
+        echo "Current time: $(date)"
+
+## Platform info (default - runs on all platforms)
+platform-info:
+    script:
+        echo "Running platform-info on default/any platform"
+        uname -a
+
+## Platform info (macOS specific)
+platform-info:
+    arch: macos
+    script:
+        echo "Running on macOS!"
+        sw_vers
+        uname -a
+
+## Platform info (Linux specific)
+platform-info:
+    arch: linux
+    script:
+        echo "Running on Linux!"
+        cat /etc/os-release
+        uname -a
+
+## Platform info (Windows specific)
+platform-info:
+    arch: windows
+    script:
+        echo "Running on Windows!"
+        ver
