@@ -62,14 +62,33 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    const task = resolve_result.task orelse {
-        util.printError("Task '{s}' not found.", .{args[1]});
+    const task = resolve_result.task orelse blk: {
+        // Task not found - check if it's a command group
+        if (help_mod.isCommandGroup(&registry, args[1])) {
+            // Check if user wants help for this group
+            if (resolve_result.remaining_args.len > 0) {
+                const next_arg = resolve_result.remaining_args[0];
+                if (std.mem.eql(u8, next_arg, "--help") or
+                    std.mem.eql(u8, next_arg, "-h") or
+                    std.mem.eql(u8, next_arg, "help"))
+                {
+                    try help_mod.printCommandGroupHelp(&registry, args[1]);
+                    std.process.exit(0);
+                }
+            }
+            // Show group help by default when no subcommand specified
+            try help_mod.printCommandGroupHelp(&registry, args[1]);
+            std.process.exit(0);
+        }
+
+        util.printError("Command '{s}' not found.", .{args[1]});
         const stderr_file = std.fs.File.stderr();
         var buf: [1024]u8 = undefined;
         var stderr_writer = stderr_file.writer(&buf);
-        try stderr_writer.interface.writeAll("\nRun 'zake' to see available tasks.\n");
+        try stderr_writer.interface.writeAll("\nRun 'zake' to see available commands.\n");
         try stderr_writer.interface.flush();
         std.process.exit(3);
+        break :blk undefined;
     };
 
     const remaining_args = resolve_result.remaining_args;
@@ -77,7 +96,7 @@ pub fn main() !void {
     // Check for task-specific --help
     if (remaining_args.len > 0) {
         if (std.mem.eql(u8, remaining_args[0], "--help") or std.mem.eql(u8, remaining_args[0], "-h")) {
-            try help_mod.printTaskHelp(task);
+            try help_mod.printTaskHelp(task, &registry);
             std.process.exit(0);
         }
     }
