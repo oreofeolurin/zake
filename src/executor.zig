@@ -5,10 +5,12 @@ const Task = task_mod.Task;
 const ScriptLine = task_mod.ScriptLine;
 const TargetOS = task_mod.TargetOS;
 const TaskRegistry = task_mod.TaskRegistry;
+const Condition = task_mod.Condition;
 const ArrayList = std.ArrayList;
 const Allocator = std.mem.Allocator;
 const StringHashMap = std.StringHashMap;
 const builtin = @import("builtin");
+const fs = std.fs;
 
 /// Variable map for substitution
 pub const VarMap = StringHashMap([]const u8);
@@ -28,15 +30,62 @@ pub fn shouldExecuteOnCurrentOS(target: TargetOS) bool {
     };
 }
 
+/// Evaluate a when: condition expression
+/// Supports:
+///   - ${VAR} == "value" / ${VAR} != "value"
+///   - {{var}} == "value"
+///   - $(command) - true if output is non-empty
+///   - "value" - true if non-empty
+///   - Plain truthy check (any non-empty, non-"false", non-"0" value is true)
+fn evaluateCondition(allocator: Allocator, expression: []const u8, vars: VarMap) !bool {
+    // First, expand all variables in the expression
+    const expanded = try substituteVariables(allocator, expression, vars);
+    defer allocator.free(expanded);
+
+    // Check for comparison operators
+    if (std.mem.indexOf(u8, expanded, "==")) |op_pos| {
+        const left = std.mem.trim(u8, expanded[0..op_pos], " \t\"");
+        const right = std.mem.trim(u8, expanded[op_pos + 2 ..], " \t\"");
+        return std.mem.eql(u8, left, right);
+    }
+
+    if (std.mem.indexOf(u8, expanded, "!=")) |op_pos| {
+        const left = std.mem.trim(u8, expanded[0..op_pos], " \t\"");
+        const right = std.mem.trim(u8, expanded[op_pos + 2 ..], " \t\"");
+        return !std.mem.eql(u8, left, right);
+    }
+
+    // No comparison - treat as truthy check
+    // Empty, "false", "0", "no" are falsy
+    const trimmed = std.mem.trim(u8, expanded, " \t\"");
+    if (trimmed.len == 0) return false;
+    if (std.mem.eql(u8, trimmed, "false")) return false;
+    if (std.mem.eql(u8, trimmed, "0")) return false;
+    if (std.mem.eql(u8, trimmed, "no")) return false;
+
+    return true;
+}
 /// Execute a task with given variable bindings
 /// registry is optional - only needed if task uses 'run' command
 pub fn executeTask(allocator: Allocator, task_ptr: *const Task, vars: VarMap) !u8 {
-    return executeTaskInternal(allocator, task_ptr, vars, null, 0);
+    var completed = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = completed.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        completed.deinit();
+    }
+    return executeTaskInternal(allocator, task_ptr, vars, null, 0, &completed);
 }
 
-/// Execute a task with registry (allows 'run' command)
+/// Execute a task with registry (allows 'run' command and requires:)
 pub fn executeTaskWithRegistry(allocator: Allocator, task_ptr: *const Task, vars: VarMap, registry: *const TaskRegistry) !u8 {
-    return executeTaskInternal(allocator, task_ptr, vars, registry, 0);
+    var completed = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = completed.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        completed.deinit();
+    }
+    return executeTaskInternal(allocator, task_ptr, vars, registry, 0, &completed);
 }
 
 /// Internal task execution with recursion tracking
@@ -46,10 +95,61 @@ fn executeTaskInternal(
     vars: VarMap,
     registry: ?*const TaskRegistry,
     depth: usize,
+    completed: *std.StringHashMap(void),
 ) !u8 {
     if (depth >= MAX_RECURSION_DEPTH) {
         util.printError("Maximum task recursion depth ({d}) exceeded", .{MAX_RECURSION_DEPTH});
         return error.RecursionLimitExceeded;
+    }
+
+    // Check when: condition before executing
+    if (task_ptr.condition) |cond| {
+        const satisfied = try evaluateCondition(allocator, cond.expression, vars);
+        if (!satisfied) {
+            util.printInfo("Skipping task '{s}' (condition not met)", .{task_ptr.name});
+            return 0; // Skip silently without error
+        }
+    }
+
+    // Execute dependencies first (requires:)
+    if (registry != null and task_ptr.requires.items.len > 0) {
+        for (task_ptr.requires.items) |dep_name| {
+            // Skip if already executed
+            if (completed.contains(dep_name)) {
+                continue;
+            }
+
+            const dep_task = registry.?.findTaskConst(dep_name) orelse {
+                util.printError("Required task '{s}' not found", .{dep_name});
+                return error.DependencyNotFound;
+            };
+
+            // Execute dependency with empty vars (deps don't inherit args)
+            var dep_vars = VarMap.init(allocator);
+            defer dep_vars.deinit();
+
+            // Copy global vars for dependencies
+            var global_iter = vars.iterator();
+            while (global_iter.next()) |entry| {
+                // Only copy if it looks like a global var (uppercase)
+                if (entry.key_ptr.len > 0 and std.ascii.isUpper(entry.key_ptr.*[0])) {
+                    const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
+                    errdefer allocator.free(key_copy);
+                    const value_copy = try allocator.dupe(u8, entry.value_ptr.*);
+                    try dep_vars.put(key_copy, value_copy);
+                }
+            }
+
+            const code = try executeTaskInternal(allocator, dep_task, dep_vars, registry, depth + 1, completed);
+            if (code != 0) {
+                util.printError("Dependency '{s}' failed with exit code {d}", .{ dep_name, code });
+                return code;
+            }
+
+            // Mark as completed
+            const name_copy = try allocator.dupe(u8, dep_name);
+            try completed.put(name_copy, {});
+        }
     }
 
     // Create a mutable copy of vars for let statements
@@ -184,7 +284,7 @@ fn executeTaskInternal(
             }
 
             // Execute the target task recursively
-            const code = try executeTaskInternal(allocator, target_task, run_vars, registry, depth + 1);
+            const code = try executeTaskInternal(allocator, target_task, run_vars, registry, depth + 1, completed);
             if (code != 0) {
                 return code;
             }

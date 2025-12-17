@@ -2,6 +2,15 @@ const std = @import("std");
 const ArrayList = std.ArrayList;
 const Allocator = std.mem.Allocator;
 
+/// Represents a when: condition expression
+pub const Condition = struct {
+    expression: []const u8, // The raw expression to evaluate
+
+    pub fn deinit(self: *Condition, allocator: Allocator) void {
+        allocator.free(self.expression);
+    }
+};
+
 /// Represents a single task defined in the Zakefile
 pub const Task = struct {
     name: []const u8,
@@ -9,6 +18,8 @@ pub const Task = struct {
     arguments: ArrayList(Argument),
     flags: ArrayList(Flag),
     script_lines: ArrayList(ScriptLine),
+    requires: ArrayList([]const u8), // Task dependencies
+    condition: ?Condition, // Optional when: condition
     target_os: TargetOS, // Which OS this task runs on
     allocator: Allocator,
 
@@ -19,6 +30,8 @@ pub const Task = struct {
             .arguments = .empty,
             .flags = .empty,
             .script_lines = .empty,
+            .requires = .empty,
+            .condition = null,
             .target_os = .any, // Default: runs on all platforms
             .allocator = allocator,
         };
@@ -44,6 +57,16 @@ pub const Task = struct {
             line.deinit(self.allocator);
         }
         self.script_lines.deinit(self.allocator);
+
+        for (self.requires.items) |req| {
+            self.allocator.free(req);
+        }
+        self.requires.deinit(self.allocator);
+
+        if (self.condition) |*cond| {
+            var c = cond.*;
+            c.deinit(self.allocator);
+        }
     }
 
     pub fn setDescription(self: *Task, desc: []const u8) !void {
@@ -67,6 +90,21 @@ pub const Task = struct {
 
     pub fn addScriptLine(self: *Task, line: ScriptLine) !void {
         try self.script_lines.append(self.allocator, line);
+    }
+
+    pub fn addRequires(self: *Task, task_name: []const u8) !void {
+        const name_copy = try self.allocator.dupe(u8, task_name);
+        try self.requires.append(self.allocator, name_copy);
+    }
+
+    pub fn setCondition(self: *Task, expression: []const u8) !void {
+        if (self.condition) |*old| {
+            var c = old.*;
+            c.deinit(self.allocator);
+        }
+        self.condition = Condition{
+            .expression = try self.allocator.dupe(u8, expression),
+        };
     }
 };
 

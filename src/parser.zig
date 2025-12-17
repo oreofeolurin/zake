@@ -109,6 +109,10 @@ pub const Parser = struct {
             try self.parseFlag(trimmed);
         } else if (std.mem.startsWith(u8, trimmed, "arch:")) {
             try self.parseArch(trimmed);
+        } else if (std.mem.startsWith(u8, trimmed, "requires:")) {
+            try self.parseRequires(trimmed);
+        } else if (std.mem.startsWith(u8, trimmed, "when:")) {
+            try self.parseWhen(trimmed);
         } else if (std.mem.startsWith(u8, trimmed, "script:")) {
             self.state = .InScript;
         } else if (self.state == .InScript) {
@@ -118,6 +122,33 @@ pub const Parser = struct {
             std.debug.print("Error at line {d}: Unknown directive: {s}\n", .{ self.line_number, trimmed });
             return error.UnknownDirective;
         }
+    }
+
+    /// Parse requires: directive (task dependencies)
+    /// Format: requires: task1 task2 task3
+    fn parseRequires(self: *Parser, line: []const u8) !void {
+        const content = std.mem.trim(u8, line[9..], " \t"); // Skip "requires:"
+
+        // Split by spaces to get task names
+        var iter = std.mem.splitAny(u8, content, " \t,");
+        while (iter.next()) |dep_name| {
+            const trimmed_dep = std.mem.trim(u8, dep_name, " \t");
+            if (trimmed_dep.len > 0) {
+                try self.current_task.?.addRequires(trimmed_dep);
+            }
+        }
+    }
+
+    /// Parse when: directive (conditional execution)
+    /// Format: when: <expression>
+    /// Supports: ${VAR} == "value", {{var}} != "", $(cmd), boolean expressions
+    fn parseWhen(self: *Parser, line: []const u8) !void {
+        const expression = std.mem.trim(u8, line[5..], " \t"); // Skip "when:"
+        if (expression.len == 0) {
+            std.debug.print("Error at line {d}: Empty when: expression\n", .{self.line_number});
+            return error.InvalidCondition;
+        }
+        try self.current_task.?.setCondition(expression);
     }
 
     /// Try to parse Makefile-style variable assignment
