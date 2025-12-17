@@ -19,6 +19,7 @@ pub const Task = struct {
     flags: ArrayList(Flag),
     script_lines: ArrayList(ScriptLine),
     requires: ArrayList([]const u8), // Task dependencies
+    aliases: ArrayList([]const u8), // Alternative task names
     condition: ?Condition, // Optional when: condition
     target_os: TargetOS, // Which OS this task runs on
     allocator: Allocator,
@@ -31,6 +32,7 @@ pub const Task = struct {
             .flags = .empty,
             .script_lines = .empty,
             .requires = .empty,
+            .aliases = .empty,
             .condition = null,
             .target_os = .any, // Default: runs on all platforms
             .allocator = allocator,
@@ -62,6 +64,11 @@ pub const Task = struct {
             self.allocator.free(req);
         }
         self.requires.deinit(self.allocator);
+
+        for (self.aliases.items) |alias| {
+            self.allocator.free(alias);
+        }
+        self.aliases.deinit(self.allocator);
 
         if (self.condition) |*cond| {
             var c = cond.*;
@@ -95,6 +102,11 @@ pub const Task = struct {
     pub fn addRequires(self: *Task, task_name: []const u8) !void {
         const name_copy = try self.allocator.dupe(u8, task_name);
         try self.requires.append(self.allocator, name_copy);
+    }
+
+    pub fn addAlias(self: *Task, alias_name: []const u8) !void {
+        const alias_copy = try self.allocator.dupe(u8, alias_name);
+        try self.aliases.append(self.allocator, alias_copy);
     }
 
     pub fn setCondition(self: *Task, expression: []const u8) !void {
@@ -212,11 +224,13 @@ pub const TargetOS = enum {
 pub const ScriptLine = struct {
     content: []const u8,
     is_silent: bool, // true if prefixed with @
+    ignore_error: bool, // true if prefixed with ?
 
-    pub fn init(allocator: Allocator, content: []const u8, is_silent: bool) !ScriptLine {
+    pub fn init(allocator: Allocator, content: []const u8, is_silent: bool, ignore_error: bool) !ScriptLine {
         return ScriptLine{
             .content = try allocator.dupe(u8, content),
             .is_silent = is_silent,
+            .ignore_error = ignore_error,
         };
     }
 
@@ -265,7 +279,7 @@ pub const TaskRegistry = struct {
         try self.global_vars.put(key_copy, value_copy);
     }
 
-    /// Find a task by name. If multiple tasks with the same name exist
+    /// Find a task by name or alias. If multiple tasks with the same name exist
     /// (due to arch: overloads), returns the best match for the current OS:
     /// 1. Exact OS match (e.g., arch:macos on macOS)
     /// 2. Category match (e.g., arch:unix on macOS)
@@ -279,7 +293,15 @@ pub const TaskRegistry = struct {
         var any_match: ?*Task = null;
 
         for (self.tasks.items) |*t| {
-            if (std.mem.eql(u8, t.name, name)) {
+            const name_matches = std.mem.eql(u8, t.name, name) or blk: {
+                // Check aliases
+                for (t.aliases.items) |alias| {
+                    if (std.mem.eql(u8, alias, name)) break :blk true;
+                }
+                break :blk false;
+            };
+
+            if (name_matches) {
                 switch (t.target_os) {
                     .any => any_match = t,
                     .linux => if (current_os == .linux) {
@@ -302,7 +324,7 @@ pub const TaskRegistry = struct {
         return exact_match orelse unix_match orelse any_match;
     }
 
-    /// Find a task by name (const version)
+    /// Find a task by name or alias (const version)
     pub fn findTaskConst(self: *const TaskRegistry, name: []const u8) ?*const Task {
         const builtin = @import("builtin");
         const current_os = builtin.os.tag;
@@ -312,7 +334,15 @@ pub const TaskRegistry = struct {
         var any_match: ?*const Task = null;
 
         for (self.tasks.items) |*t| {
-            if (std.mem.eql(u8, t.name, name)) {
+            const name_matches = std.mem.eql(u8, t.name, name) or blk: {
+                // Check aliases
+                for (t.aliases.items) |alias| {
+                    if (std.mem.eql(u8, alias, name)) break :blk true;
+                }
+                break :blk false;
+            };
+
+            if (name_matches) {
                 switch (t.target_os) {
                     .any => any_match = t,
                     .linux => if (current_os == .linux) {

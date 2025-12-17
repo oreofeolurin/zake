@@ -321,6 +321,21 @@ pub fn printTaskHelp(task: *const Task, registry: ?*const TaskRegistry) !void {
         try stdout.writeAll("\n\n");
     }
 
+    // Print aliases if any
+    if (task.aliases.items.len > 0) {
+        try stdout.writeAll(util.Color.Bold);
+        try stdout.writeAll("ALIASES:\n");
+        try stdout.writeAll(util.Color.Reset);
+        try stdout.writeAll("  ");
+        for (task.aliases.items, 0..) |alias, i| {
+            if (i > 0) try stdout.writeAll(", ");
+            try stdout.writeAll(util.Color.Cyan);
+            try stdout.writeAll(alias);
+            try stdout.writeAll(util.Color.Reset);
+        }
+        try stdout.writeAll("\n\n");
+    }
+
     // Print usage
     try stdout.writeAll(util.Color.Bold);
     try stdout.writeAll("USAGE:\n");

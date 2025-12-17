@@ -173,10 +173,16 @@ fn executeTaskInternal(
     }
 
     for (task_ptr.script_lines.items) |script_line| {
-        const content = script_line.content;
+        var content = script_line.content;
 
-        // Check for "let varname = value" statement
-        if (std.mem.startsWith(u8, content, "let ")) {
+        // Check for explicit shell prefix ($) - skip keyword parsing
+        const is_explicit_shell = std.mem.startsWith(u8, content, "$ ");
+        if (is_explicit_shell) {
+            content = std.mem.trim(u8, content[2..], " \t"); // Skip "$ "
+        }
+
+        // Check for "let varname = value" statement (unless explicit shell)
+        if (!is_explicit_shell and std.mem.startsWith(u8, content, "let ")) {
             const rest = content[4..]; // Skip "let "
 
             // Find the equals sign
@@ -212,8 +218,8 @@ fn executeTaskInternal(
             continue;
         }
 
-        // Check for "run taskname [args...]" statement
-        if (std.mem.startsWith(u8, content, "run ")) {
+        // Check for "run taskname [args...]" statement (unless explicit shell)
+        if (!is_explicit_shell and std.mem.startsWith(u8, content, "run ")) {
             if (registry == null) {
                 util.printError("Cannot use 'run' command: no task registry available", .{});
                 return error.NoRegistryForRun;
@@ -285,7 +291,7 @@ fn executeTaskInternal(
 
             // Execute the target task recursively
             const code = try executeTaskInternal(allocator, target_task, run_vars, registry, depth + 1, completed);
-            if (code != 0) {
+            if (code != 0 and !script_line.ignore_error) {
                 return code;
             }
             continue;
@@ -297,7 +303,7 @@ fn executeTaskInternal(
 
         // Execute the command
         const code = try executeShellCommand(allocator, substituted, !script_line.is_silent);
-        if (code != 0) {
+        if (code != 0 and !script_line.ignore_error) {
             return code;
         }
     }

@@ -113,6 +113,8 @@ pub const Parser = struct {
             try self.parseRequires(trimmed);
         } else if (std.mem.startsWith(u8, trimmed, "when:")) {
             try self.parseWhen(trimmed);
+        } else if (std.mem.startsWith(u8, trimmed, "alias:")) {
+            try self.parseAlias(trimmed);
         } else if (std.mem.startsWith(u8, trimmed, "script:")) {
             self.state = .InScript;
         } else if (self.state == .InScript) {
@@ -149,6 +151,21 @@ pub const Parser = struct {
             return error.InvalidCondition;
         }
         try self.current_task.?.setCondition(expression);
+    }
+
+    /// Parse alias: directive (alternative task names)
+    /// Format: alias: name1 name2 name3
+    fn parseAlias(self: *Parser, line: []const u8) !void {
+        const content = std.mem.trim(u8, line[6..], " \t"); // Skip "alias:"
+
+        // Split by spaces to get alias names
+        var iter = std.mem.splitAny(u8, content, " \t,");
+        while (iter.next()) |alias_name| {
+            const trimmed_alias = std.mem.trim(u8, alias_name, " \t");
+            if (trimmed_alias.len > 0) {
+                try self.current_task.?.addAlias(trimmed_alias);
+            }
+        }
     }
 
     /// Try to parse Makefile-style variable assignment
@@ -461,12 +478,28 @@ pub const Parser = struct {
     }
 
     /// Parse a script line
+    /// Prefixes: @ = silent, ? = ignore errors, @? or ?@ = both
     fn parseScriptLine(self: *Parser, line: []const u8) !void {
-        // Check if line starts with @ (silent)
-        const is_silent = line.len > 0 and line[0] == '@';
-        const content = if (is_silent) std.mem.trim(u8, line[1..], " \t") else line;
+        var is_silent = false;
+        var ignore_error = false;
+        var content = line;
 
-        const script_line = try ScriptLine.init(self.allocator, content, is_silent);
+        // Parse prefixes (can be @, ?, @?, ?@)
+        while (content.len > 0) {
+            if (content[0] == '@') {
+                is_silent = true;
+                content = content[1..];
+            } else if (content[0] == '?') {
+                ignore_error = true;
+                content = content[1..];
+            } else {
+                break;
+            }
+        }
+
+        content = std.mem.trim(u8, content, " \t");
+
+        const script_line = try ScriptLine.init(self.allocator, content, is_silent, ignore_error);
         try self.current_task.?.addScriptLine(script_line);
     }
 };
