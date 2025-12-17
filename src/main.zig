@@ -49,18 +49,21 @@ pub fn main() !void {
         std.process.exit(0);
     }
 
-    // Get task name
-    const task_name = args[1];
-
     // Check for global --help or -h
-    if (std.mem.eql(u8, task_name, "--help") or std.mem.eql(u8, task_name, "-h")) {
+    if (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h")) {
         try help_mod.printOverview(&registry);
         std.process.exit(0);
     }
 
-    // Find the task
-    const task = registry.findTask(task_name) orelse {
-        util.printError("Task '{s}' not found.", .{task_name});
+    // Resolve task name with subcommand support
+    // Try joining args with dots: "secrets" "view" -> "secrets.view"
+    const resolve_result = resolveTaskName(allocator, &registry, args[1..]) catch |err| {
+        util.printError("Failed to resolve task: {s}", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    const task = resolve_result.task orelse {
+        util.printError("Task '{s}' not found.", .{args[1]});
         const stderr_file = std.fs.File.stderr();
         var buf: [1024]u8 = undefined;
         var stderr_writer = stderr_file.writer(&buf);
@@ -69,9 +72,11 @@ pub fn main() !void {
         std.process.exit(3);
     };
 
+    const remaining_args = resolve_result.remaining_args;
+
     // Check for task-specific --help
-    if (args.len > 2) {
-        if (std.mem.eql(u8, args[2], "--help") or std.mem.eql(u8, args[2], "-h")) {
+    if (remaining_args.len > 0) {
+        if (std.mem.eql(u8, remaining_args[0], "--help") or std.mem.eql(u8, remaining_args[0], "-h")) {
             try help_mod.printTaskHelp(task);
             std.process.exit(0);
         }
@@ -88,7 +93,7 @@ pub fn main() !void {
         vars.deinit();
     }
 
-    try parseTaskArgs(allocator, task, args[2..], &vars);
+    try parseTaskArgs(allocator, task, remaining_args, &vars);
 
     // Execute the task
     const exit_code = executor_mod.executeTask(allocator, task, vars) catch |err| {
@@ -97,7 +102,7 @@ pub fn main() !void {
     };
 
     if (exit_code != 0) {
-        util.printError("Task '{s}' failed with exit code {d}", .{ task_name, exit_code });
+        util.printError("Task '{s}' failed with exit code {d}", .{ task.name, exit_code });
         std.process.exit(exit_code);
     }
 }
@@ -110,6 +115,72 @@ fn readZakefile(allocator: std.mem.Allocator) ![]u8 {
 
     const max_size = 10 * 1024 * 1024; // 10 MB max
     return try file.readToEndAlloc(allocator, max_size);
+}
+
+/// Result of task name resolution
+const ResolveResult = struct {
+    task: ?*task_mod.Task,
+    remaining_args: []const [:0]const u8,
+};
+
+/// Resolve task name with subcommand support
+/// Tries joining CLI args with dots to find a matching task:
+///   "secrets" "view" -> tries "secrets.view", then "secrets"
+///   "build" -> tries "build"
+fn resolveTaskName(
+    allocator: std.mem.Allocator,
+    registry: *TaskRegistry,
+    args: []const [:0]const u8,
+) !ResolveResult {
+    if (args.len == 0) {
+        return ResolveResult{ .task = null, .remaining_args = args };
+    }
+
+    // Try progressively longer dot-joined names
+    // Start with most specific (all args joined) and work backwards
+    var max_parts = @min(args.len, 10); // Limit depth to 10 subcommands
+
+    // Find how many args could be part of the task name (stop at first flag)
+    for (args, 0..) |arg, idx| {
+        if (arg.len > 0 and arg[0] == '-') {
+            max_parts = @min(max_parts, idx);
+            break;
+        }
+    }
+
+    // Try from longest to shortest
+    var parts: usize = max_parts;
+    while (parts > 0) : (parts -= 1) {
+        // Build the task name by joining args[0..parts] with dots
+        var name_buf: [512]u8 = undefined;
+        var name_len: usize = 0;
+
+        for (args[0..parts], 0..) |arg, i| {
+            if (i > 0) {
+                name_buf[name_len] = '.';
+                name_len += 1;
+            }
+            if (name_len + arg.len > name_buf.len) {
+                return error.TaskNameTooLong;
+            }
+            @memcpy(name_buf[name_len .. name_len + arg.len], arg);
+            name_len += arg.len;
+        }
+
+        const task_name = name_buf[0..name_len];
+
+        // Try to find this task
+        if (registry.findTask(task_name)) |task| {
+            return ResolveResult{
+                .task = task,
+                .remaining_args = args[parts..],
+            };
+        }
+    }
+
+    // No match found - return null task with original first arg
+    _ = allocator;
+    return ResolveResult{ .task = null, .remaining_args = args };
 }
 
 /// Parse task arguments and flags from command line
