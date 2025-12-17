@@ -175,10 +175,20 @@ pub const Parser = struct {
         const processed_value = try self.expandMakefileVars(value);
         defer if (processed_value.ptr != value.ptr) self.allocator.free(processed_value);
 
-        // For conditional assignment, only set if not already defined
+        // For conditional assignment (?=), only set if not already defined
+        // Check both Zakefile vars AND environment variables
         if (is_conditional) {
             if (self.registry.global_vars.get(var_name) != null) {
-                return true; // Already defined, skip
+                return true; // Already defined in Zakefile, skip
+            }
+            // Check environment variable
+            var env_name_buf: [256]u8 = undefined;
+            if (var_name.len < 256) {
+                @memcpy(env_name_buf[0..var_name.len], var_name);
+                env_name_buf[var_name.len] = 0;
+                if (std.posix.getenv(env_name_buf[0..var_name.len :0]) != null) {
+                    return true; // Already defined in environment, skip
+                }
             }
         }
 

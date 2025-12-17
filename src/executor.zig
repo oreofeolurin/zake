@@ -224,7 +224,18 @@ pub fn substituteVariables(gpa: Allocator, template: []const u8, vars: VarMap) !
             };
 
             const var_name = template[i + 2 .. i + 2 + close_pos];
-            const value = vars.get(var_name) orelse "";
+
+            // First check VarMap, then fall back to environment variable
+            const value = vars.get(var_name) orelse blk: {
+                // Check environment variable as fallback
+                var env_name_buf: [256]u8 = undefined;
+                if (var_name.len < 256) {
+                    @memcpy(env_name_buf[0..var_name.len], var_name);
+                    env_name_buf[var_name.len] = 0;
+                    break :blk std.posix.getenv(env_name_buf[0..var_name.len :0]) orelse "";
+                }
+                break :blk "";
+            };
 
             try result.appendSlice(gpa, value);
             i = i + 2 + close_pos + 2;
