@@ -15,7 +15,6 @@ const ParserState = enum {
     TopLevel, // Outside any task
     InTaskDefinition, // Inside task, before script:
     InScript, // Inside script: block
-    InVars, // Inside vars: block
 };
 
 /// Parser for Zakefile
@@ -78,30 +77,23 @@ pub const Parser = struct {
             return;
         }
 
-        // Check for vars: block (top-level only)
-        if (!isIndented(line) and std.mem.eql(u8, trimmed, "vars:")) {
-            self.state = .InVars;
-            self.current_task = null; // Exit any current task
-            return;
-        }
-
-        // Handle vars: block content
-        if (self.state == .InVars) {
-            if (!isIndented(line)) {
-                // Non-indented line ends vars: block - reprocess as normal line
-                self.state = .TopLevel;
-                // Fall through to handle this line
-            } else {
-                // Parse variable assignment: NAME: "value" or NAME: value
-                try self.parseGlobalVar(trimmed);
+        // Check for Makefile-style variable assignment at top level (not indented)
+        // Formats: VAR = value, VAR := value, VAR ?= value
+        if (!isIndented(line) and self.current_task == null) {
+            if (try self.tryParseMakefileVar(trimmed)) {
                 return;
             }
         }
 
         // Check if this is a task definition (ends with : and not indented)
         if (!isIndented(line) and std.mem.endsWith(u8, trimmed, ":")) {
-            try self.startNewTask(trimmed);
-            return;
+            // Make sure it's not a variable assignment (has = before :)
+            const eq_pos = std.mem.indexOf(u8, trimmed, "=");
+            const colon_pos = std.mem.indexOf(u8, trimmed, ":");
+            if (eq_pos == null or (colon_pos != null and colon_pos.? < eq_pos.?)) {
+                try self.startNewTask(trimmed);
+                return;
+            }
         }
 
         // Must be inside a task for anything else
@@ -128,33 +120,123 @@ pub const Parser = struct {
         }
     }
 
-    /// Parse global variable in vars: block
-    /// Format: NAME: "value" or NAME: value
-    fn parseGlobalVar(self: *Parser, line: []const u8) !void {
-        // Find the colon
-        const colon_pos = std.mem.indexOf(u8, line, ":") orelse {
-            std.debug.print("Error at line {d}: Invalid variable format, expected 'NAME: value'\n", .{self.line_number});
-            return error.InvalidVarSyntax;
-        };
+    /// Try to parse Makefile-style variable assignment
+    /// Returns true if line was a variable assignment, false otherwise
+    fn tryParseMakefileVar(self: *Parser, line: []const u8) !bool {
+        // Look for assignment operators: ?=, :=, =
+        var op_pos: ?usize = null;
+        var op_len: usize = 1;
+        var is_conditional: bool = false;
 
-        const var_name = std.mem.trim(u8, line[0..colon_pos], " \t");
-        if (var_name.len == 0) {
-            std.debug.print("Error at line {d}: Empty variable name\n", .{self.line_number});
-            return error.InvalidVarSyntax;
+        // Check for ?= first
+        if (std.mem.indexOf(u8, line, "?=")) |pos| {
+            op_pos = pos;
+            op_len = 2;
+            is_conditional = true;
+        }
+        // Check for :=
+        else if (std.mem.indexOf(u8, line, ":=")) |pos| {
+            op_pos = pos;
+            op_len = 2;
+        }
+        // Check for simple =
+        else if (std.mem.indexOf(u8, line, "=")) |pos| {
+            // Make sure it's not part of another operator
+            if (pos > 0 and (line[pos - 1] == '?' or line[pos - 1] == ':' or line[pos - 1] == '!')) {
+                return false;
+            }
+            op_pos = pos;
+            op_len = 1;
         }
 
-        var value = std.mem.trim(u8, line[colon_pos + 1 ..], " \t");
+        if (op_pos == null) {
+            return false;
+        }
 
-        // Strip quotes if present
-        if (value.len >= 2) {
-            if ((value[0] == '"' and value[value.len - 1] == '"') or
-                (value[0] == '\'' and value[value.len - 1] == '\''))
-            {
-                value = value[1 .. value.len - 1];
+        const pos = op_pos.?;
+
+        // Extract variable name (must be valid identifier)
+        const var_name = std.mem.trim(u8, line[0..pos], " \t");
+        if (var_name.len == 0) {
+            return false;
+        }
+
+        // Check if var_name looks like an identifier (letters, digits, underscore)
+        for (var_name) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '_') {
+                return false; // Not a variable assignment
             }
         }
 
-        try self.registry.addGlobalVar(var_name, value);
+        // Extract value
+        const value = std.mem.trim(u8, line[pos + op_len ..], " \t");
+
+        // Process $(VAR) references in the value
+        const processed_value = try self.expandMakefileVars(value);
+        defer if (processed_value.ptr != value.ptr) self.allocator.free(processed_value);
+
+        // For conditional assignment, only set if not already defined
+        if (is_conditional) {
+            if (self.registry.global_vars.get(var_name) != null) {
+                return true; // Already defined, skip
+            }
+        }
+
+        try self.registry.addGlobalVar(var_name, processed_value);
+        return true;
+    }
+
+    /// Expand $(VAR) references in a value using already-defined global vars
+    fn expandMakefileVars(self: *Parser, value: []const u8) ![]const u8 {
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(self.allocator);
+
+        var i: usize = 0;
+        var has_substitutions = false;
+
+        while (i < value.len) {
+            // Check for $(VAR)
+            if (i + 2 < value.len and value[i] == '$' and value[i + 1] == '(') {
+                const close_pos = std.mem.indexOf(u8, value[i + 2 ..], ")") orelse {
+                    // No closing paren, treat as literal
+                    try result.append(self.allocator, value[i]);
+                    i += 1;
+                    continue;
+                };
+
+                const var_ref = value[i + 2 .. i + 2 + close_pos];
+                has_substitutions = true;
+
+                // Look up in global vars
+                if (self.registry.global_vars.get(var_ref)) |var_value| {
+                    try result.appendSlice(self.allocator, var_value);
+                } else {
+                    // Check environment variable as fallback
+                    var env_name_buf: [256]u8 = undefined;
+                    if (var_ref.len < 256) {
+                        @memcpy(env_name_buf[0..var_ref.len], var_ref);
+                        env_name_buf[var_ref.len] = 0;
+                        if (std.posix.getenv(env_name_buf[0..var_ref.len :0])) |env_val| {
+                            try result.appendSlice(self.allocator, env_val);
+                        }
+                        // If not found, leave empty (like Make)
+                    }
+                }
+
+                i = i + 2 + close_pos + 1;
+                continue;
+            }
+
+            try result.append(self.allocator, value[i]);
+            i += 1;
+        }
+
+        if (has_substitutions) {
+            return result.toOwnedSlice(self.allocator);
+        } else {
+            result.deinit(self.allocator);
+            return value;
+        }
     }
 
     /// Handle description comment (##)

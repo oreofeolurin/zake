@@ -1,9 +1,9 @@
 # Example Zakefile for Zake Phase 1
 
 # Global variables
-APP_NAME: "my-awesome-app"
-VERSION: "1.0.0"
-BUILD_DIR: dist
+APP_NAME = "my-awesome-app"
+VERSION = "1.0.0"
+BUILD_DIR = "dist"
 
 ## Build the project
 build:
