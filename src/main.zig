@@ -22,7 +22,10 @@ pub fn main() !void {
     const zakefile_content = readZakefile(allocator) catch |err| {
         switch (err) {
             error.FileNotFound => {
-                util.printError("Zakefile not found in current directory.", .{});
+                util.printError("Zakefile not found.", .{});
+                std.debug.print("\nSearched current directory and up to 5 parent levels for:\n", .{});
+                std.debug.print("  - Zakefile\n", .{});
+                std.debug.print("  - *.zake files\n", .{});
                 std.process.exit(10);
             },
             else => {
@@ -138,14 +141,99 @@ pub fn main() !void {
     }
 }
 
-/// Read the Zakefile from the current directory
+/// Find and read the Zakefile, searching current directory and up to 5 parent levels
+/// Search order in each directory: Zakefile, then *.zake files (alphabetically first wins)
 fn readZakefile(allocator: std.mem.Allocator) ![]u8 {
+    const result = try findZakefile(allocator);
+    defer if (result.path) |p| allocator.free(p);
+
+    if (result.path == null) {
+        return error.FileNotFound;
+    }
+
+    // Change to the directory containing the Zakefile for relative imports
+    if (result.dir) |dir| {
+        std.posix.chdir(dir) catch {};
+    }
+
     const cwd = std.fs.cwd();
-    const file = try cwd.openFile("Zakefile", .{});
+    const file = try cwd.openFile(result.filename, .{});
     defer file.close();
 
     const max_size = 10 * 1024 * 1024; // 10 MB max
     return try file.readToEndAlloc(allocator, max_size);
+}
+
+/// Result of Zakefile search
+const FindResult = struct {
+    path: ?[]const u8, // Full path (owned, must be freed)
+    dir: ?[]const u8, // Directory containing file (slice of path)
+    filename: []const u8, // Just the filename
+};
+
+/// Search for Zakefile in current directory and up to 5 parent levels
+fn findZakefile(allocator: std.mem.Allocator) !FindResult {
+    const max_levels = 5;
+    var search_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+    // Get absolute path of current directory
+    const cwd_path = try std.fs.cwd().realpath(".", &search_path_buf);
+
+    var current_path: []const u8 = cwd_path;
+    var level: usize = 0;
+
+    while (level <= max_levels) : (level += 1) {
+        // Try to open directory
+        var dir = std.fs.openDirAbsolute(current_path, .{ .iterate = true }) catch {
+            break; // Can't open directory, stop searching
+        };
+        defer dir.close();
+
+        // First, try "Zakefile"
+        if (dir.openFile("Zakefile", .{})) |file| {
+            file.close();
+            const full_path = try std.fs.path.join(allocator, &[_][]const u8{ current_path, "Zakefile" });
+            const dir_end = std.mem.lastIndexOf(u8, full_path, "/") orelse 0;
+            return FindResult{
+                .path = full_path,
+                .dir = if (dir_end > 0) full_path[0..dir_end] else null,
+                .filename = "Zakefile",
+            };
+        } else |_| {}
+
+        // Second, try *.zake files (find first alphabetically)
+        var first_zake: ?[]const u8 = null;
+        var iter = dir.iterate();
+        while (iter.next() catch null) |entry| {
+            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zake")) {
+                if (first_zake == null or std.mem.lessThan(u8, entry.name, first_zake.?)) {
+                    if (first_zake) |fz| allocator.free(fz);
+                    first_zake = try allocator.dupe(u8, entry.name);
+                }
+            }
+        }
+
+        if (first_zake) |zake_file| {
+            const full_path = try std.fs.path.join(allocator, &[_][]const u8{ current_path, zake_file });
+            const dir_end = std.mem.lastIndexOf(u8, full_path, "/") orelse 0;
+            const filename = try allocator.dupe(u8, zake_file);
+            allocator.free(zake_file);
+            return FindResult{
+                .path = full_path,
+                .dir = if (dir_end > 0) full_path[0..dir_end] else null,
+                .filename = filename,
+            };
+        }
+
+        // Move to parent directory
+        if (std.fs.path.dirname(current_path)) |parent| {
+            current_path = parent;
+        } else {
+            break; // Reached root
+        }
+    }
+
+    return FindResult{ .path = null, .dir = null, .filename = "" };
 }
 
 /// Result of task name resolution
