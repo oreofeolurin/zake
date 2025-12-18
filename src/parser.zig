@@ -15,6 +15,7 @@ const ParserState = enum {
     TopLevel, // Outside any task
     InTaskDefinition, // Inside task, before script:
     InScript, // Inside script: block
+    InMultilineScript, // Inside a multi-line script block ($ or @)
 };
 
 /// Parser for Zakefile
@@ -25,6 +26,11 @@ pub const Parser = struct {
     state: ParserState,
     pending_description: ?[]const u8,
     line_number: usize,
+    base_dir: ?[]const u8, // Base directory for resolving imports
+    multiline_buffer: std.ArrayList(u8), // Buffer for multi-line script content
+    multiline_silent: bool, // Whether current multi-line block is silent
+    multiline_ignore_error: bool, // Whether current multi-line block ignores errors
+    multiline_indent: usize, // Indentation level of multi-line content
 
     pub fn init(allocator: Allocator) Parser {
         return Parser{
@@ -34,18 +40,28 @@ pub const Parser = struct {
             .state = .TopLevel,
             .pending_description = null,
             .line_number = 0,
+            .base_dir = null,
+            .multiline_buffer = .empty,
+            .multiline_silent = false,
+            .multiline_ignore_error = false,
+            .multiline_indent = 0,
         };
+    }
+
+    pub fn setBaseDir(self: *Parser, dir: []const u8) void {
+        self.base_dir = dir;
     }
 
     pub fn deinit(self: *Parser) void {
         if (self.pending_description) |desc| {
             self.allocator.free(desc);
         }
+        self.multiline_buffer.deinit(self.allocator);
         self.registry.deinit();
     }
 
     /// Parse the entire Zakefile content
-    pub fn parse(self: *Parser, content: []const u8) !TaskRegistry {
+    pub fn parse(self: *Parser, content: []const u8) anyerror!TaskRegistry {
         var line_iter = std.mem.splitScalar(u8, content, '\n');
 
         while (line_iter.next()) |line| {
@@ -53,15 +69,66 @@ pub const Parser = struct {
             try self.parseLine(line);
         }
 
+        // Finalize any pending multi-line block
+        try self.finalizeMultilineBlock();
+
         // Transfer ownership of registry
         const result = self.registry;
         self.registry = TaskRegistry.init(self.allocator);
         return result;
     }
 
+    /// Finalize a multi-line script block and add it to the current task
+    fn finalizeMultilineBlock(self: *Parser) !void {
+        if (self.state != .InMultilineScript or self.multiline_buffer.items.len == 0) {
+            return;
+        }
+
+        // Add the accumulated multi-line content as a single script line
+        const script_line = try ScriptLine.initMultiline(
+            self.allocator,
+            self.multiline_buffer.items,
+            self.multiline_silent,
+            self.multiline_ignore_error,
+        );
+        try self.current_task.?.addScriptLine(script_line);
+
+        // Reset multi-line state
+        self.multiline_buffer.clearRetainingCapacity();
+        self.multiline_silent = false;
+        self.multiline_ignore_error = false;
+        self.multiline_indent = 0;
+        self.state = .InScript;
+    }
+
     /// Parse a single line
-    fn parseLine(self: *Parser, line: []const u8) !void {
+    fn parseLine(self: *Parser, line: []const u8) anyerror!void {
         const trimmed = std.mem.trim(u8, line, " \t\r");
+
+        // Handle multi-line script accumulation
+        if (self.state == .InMultilineScript) {
+            // Check if this line is still part of the multi-line block
+            // It must be indented at least as much as the content start
+            if (isIndented(line)) {
+                const indent = getIndentLevel(line);
+                // Accept lines that are indented at the multiline indent level or more
+                if (indent >= self.multiline_indent) {
+                    // Add newline if not the first line
+                    if (self.multiline_buffer.items.len > 0) {
+                        try self.multiline_buffer.append(self.allocator, '\n');
+                    }
+                    // Strip the base indentation and add the content
+                    const content_start = self.multiline_indent;
+                    if (content_start < line.len) {
+                        try self.multiline_buffer.appendSlice(self.allocator, std.mem.trimRight(u8, line[content_start..], " \t\r"));
+                    }
+                    return;
+                }
+            }
+            // Line is not indented enough or empty - finalize the multi-line block
+            try self.finalizeMultilineBlock();
+            // Fall through to process this line normally
+        }
 
         // Skip empty lines
         if (trimmed.len == 0) {
@@ -75,6 +142,18 @@ pub const Parser = struct {
                 try self.handleDescriptionComment(trimmed);
             }
             return;
+        }
+
+        // Check for import: directive at top level
+        // Supports: import: path, import "path"
+        if (!isIndented(line)) {
+            if (std.mem.startsWith(u8, trimmed, "import:")) {
+                try self.parseImportColon(trimmed);
+                return;
+            } else if (std.mem.startsWith(u8, trimmed, "import ")) {
+                try self.parseImportQuoted(trimmed);
+                return;
+            }
         }
 
         // Check for Makefile-style variable assignment at top level (not indented)
@@ -115,14 +194,25 @@ pub const Parser = struct {
             try self.parseWhen(trimmed);
         } else if (std.mem.startsWith(u8, trimmed, "alias:")) {
             try self.parseAlias(trimmed);
+        } else if (std.mem.startsWith(u8, trimmed, "matrix:")) {
+            try self.parseMatrix(trimmed);
         } else if (std.mem.startsWith(u8, trimmed, "script:")) {
             self.state = .InScript;
+        } else if (std.mem.startsWith(u8, trimmed, "zake::")) {
+            // Stdlib call - treat as script line and enter script mode
+            self.state = .InScript;
+            try self.parseScriptLine(trimmed, line);
+        } else if (std.mem.startsWith(u8, trimmed, "let ")) {
+            // Variable assignment - treat as script line and enter script mode
+            self.state = .InScript;
+            try self.parseScriptLine(trimmed, line);
         } else if (self.state == .InScript) {
-            try self.parseScriptLine(trimmed);
+            try self.parseScriptLine(trimmed, line);
         } else {
-            // Unknown directive in definition zone
-            std.debug.print("Error at line {d}: Unknown directive: {s}\n", .{ self.line_number, trimmed });
-            return error.UnknownDirective;
+            // Not a directive - assume it's a script line and enter script mode
+            // This handles implicit script lines without explicit "script:" block
+            self.state = .InScript;
+            try self.parseScriptLine(trimmed, line);
         }
     }
 
@@ -166,6 +256,168 @@ pub const Parser = struct {
                 try self.current_task.?.addAlias(trimmed_alias);
             }
         }
+    }
+
+    /// Parse matrix: directive (combinatorial execution)
+    /// Format: matrix: var=[val1, val2, val3]
+    /// Multiple matrix lines can be used for multiple dimensions
+    fn parseMatrix(self: *Parser, line: []const u8) !void {
+        const content = std.mem.trim(u8, line[7..], " \t"); // Skip "matrix:"
+
+        // Find the equals sign
+        const eq_pos = std.mem.indexOf(u8, content, "=") orelse {
+            std.debug.print("Error at line {d}: Invalid matrix format, expected var=[...]\n", .{self.line_number});
+            return error.InvalidMatrix;
+        };
+
+        const var_name = std.mem.trim(u8, content[0..eq_pos], " \t");
+        if (var_name.len == 0) {
+            std.debug.print("Error at line {d}: Empty matrix variable name\n", .{self.line_number});
+            return error.InvalidMatrix;
+        }
+
+        // Get the values part - should be [val1, val2, ...]
+        const values_part = std.mem.trim(u8, content[eq_pos + 1 ..], " \t");
+
+        if (!std.mem.startsWith(u8, values_part, "[") or !std.mem.endsWith(u8, values_part, "]")) {
+            std.debug.print("Error at line {d}: Matrix values must be in brackets [...]\n", .{self.line_number});
+            return error.InvalidMatrix;
+        }
+
+        // Extract values between brackets
+        const values_content = values_part[1 .. values_part.len - 1];
+
+        // Parse comma-separated values
+        var values: ArrayList([]const u8) = .empty;
+        defer values.deinit(self.allocator);
+
+        var iter = std.mem.splitScalar(u8, values_content, ',');
+        while (iter.next()) |val| {
+            const trimmed_val = std.mem.trim(u8, val, " \t");
+            if (trimmed_val.len > 0) {
+                try values.append(self.allocator, trimmed_val);
+            }
+        }
+
+        if (values.items.len == 0) {
+            std.debug.print("Error at line {d}: Matrix must have at least one value\n", .{self.line_number});
+            return error.InvalidMatrix;
+        }
+
+        try self.current_task.?.addMatrixVariable(var_name, values.items);
+    }
+
+    /// Parse import: directive
+    /// Format: import: path/to/file.zake
+    /// Format: import: "path/to/file.zake"
+    /// Format: import: path/to/dir (loads Zakefile from that directory)
+    fn parseImportColon(self: *Parser, line: []const u8) !void {
+        var path = std.mem.trim(u8, line[7..], " \t"); // Skip "import:"
+        if (path.len == 0) {
+            std.debug.print("Error at line {d}: Empty import path\n", .{self.line_number});
+            return error.InvalidImport;
+        }
+
+        // Remove quotes if present
+        if (path.len >= 2 and path[0] == '"' and path[path.len - 1] == '"') {
+            path = path[1 .. path.len - 1];
+        }
+
+        try self.processImport(path);
+    }
+
+    /// Parse import "path" syntax
+    fn parseImportQuoted(self: *Parser, line: []const u8) !void {
+        var path = std.mem.trim(u8, line[7..], " \t"); // Skip "import "
+
+        // Remove quotes if present
+        if (path.len >= 2 and path[0] == '"' and path[path.len - 1] == '"') {
+            path = path[1 .. path.len - 1];
+        }
+
+        if (path.len == 0) {
+            std.debug.print("Error at line {d}: Empty import path\n", .{self.line_number});
+            return error.InvalidImport;
+        }
+
+        try self.processImport(path);
+    }
+
+    /// Process import - shared logic for both syntaxes
+    fn processImport(self: *Parser, path: []const u8) !void {
+        // Resolve the path relative to base_dir
+        const resolved_path = if (self.base_dir) |base| blk: {
+            if (std.fs.path.isAbsolute(path)) {
+                break :blk try self.allocator.dupe(u8, path);
+            }
+            break :blk try std.fs.path.join(self.allocator, &[_][]const u8{ base, path });
+        } else blk: {
+            break :blk try self.allocator.dupe(u8, path);
+        };
+        defer self.allocator.free(resolved_path);
+
+        // Determine the actual file path
+        var file_path: []const u8 = undefined;
+        var owns_file_path = false;
+
+        // Check if it's a directory (append Zakefile)
+        if (std.fs.cwd().openDir(resolved_path, .{})) |dir| {
+            var d = dir;
+            d.close();
+            file_path = try std.fs.path.join(self.allocator, &[_][]const u8{ resolved_path, "Zakefile" });
+            owns_file_path = true;
+        } else |_| {
+            file_path = resolved_path;
+        }
+        defer if (owns_file_path) self.allocator.free(file_path);
+
+        // Read the imported file
+        const file_content = std.fs.cwd().readFileAlloc(self.allocator, file_path, 1024 * 1024) catch |err| {
+            std.debug.print("Error at line {d}: Cannot read import '{s}': {any}\n", .{ self.line_number, file_path, err });
+            return error.ImportNotFound;
+        };
+        defer self.allocator.free(file_content);
+
+        // Get the directory of the imported file for nested imports
+        const import_dir = std.fs.path.dirname(file_path) orelse ".";
+
+        // Create a sub-parser for the imported file
+        var sub_parser = Parser.init(self.allocator);
+        defer sub_parser.deinit();
+        sub_parser.base_dir = import_dir;
+
+        // Parse the imported file
+        var imported_registry = try sub_parser.parse(file_content);
+
+        // Merge imported tasks into current registry
+        for (imported_registry.tasks.items) |imported_task| {
+            // Check for duplicate task names
+            if (self.registry.findTask(imported_task.name)) |_| {
+                std.debug.print("Warning: import '{s}' contains duplicate task '{s}', skipping\n", .{ file_path, imported_task.name });
+                // Need to deinit the skipped task
+                var task_copy = imported_task;
+                task_copy.deinit();
+                continue;
+            }
+            // Move task to our registry (transfer ownership)
+            try self.registry.tasks.append(self.allocator, imported_task);
+        }
+        // Clear the imported registry's tasks to prevent double-free
+        // (ownership has been transferred to self.registry)
+        imported_registry.tasks.clearAndFree(self.allocator);
+
+        // Merge imported global variables
+        var var_iter = imported_registry.global_vars.iterator();
+        while (var_iter.next()) |entry| {
+            if (!self.registry.global_vars.contains(entry.key_ptr.*)) {
+                const key_copy = try self.allocator.dupe(u8, entry.key_ptr.*);
+                errdefer self.allocator.free(key_copy);
+                const value_copy = try self.allocator.dupe(u8, entry.value_ptr.*);
+                try self.registry.global_vars.put(key_copy, value_copy);
+            }
+        }
+        
+        // Now safe to let sub_parser deinit - tasks have been moved out
     }
 
     /// Try to parse Makefile-style variable assignment
@@ -354,7 +606,7 @@ pub const Parser = struct {
 
         const arg_name = content[start_bracket + 1 .. start_bracket + end_bracket];
 
-        // Find [type] or [type?]
+        // Find [type], [type?], or [type="default"]
         const type_start = std.mem.indexOf(u8, content[start_bracket + end_bracket..], "[") orelse {
             std.debug.print("Error at line {d}: Argument missing [type]\n", .{self.line_number});
             return error.InvalidArgumentSyntax;
@@ -479,12 +731,13 @@ pub const Parser = struct {
 
     /// Parse a script line
     /// Prefixes: @ = silent, ? = ignore errors, @? or ?@ = both
-    fn parseScriptLine(self: *Parser, line: []const u8) !void {
+    /// Multi-line: $ or @ alone on a line starts a multi-line block
+    fn parseScriptLine(self: *Parser, trimmed: []const u8, original_line: []const u8) !void {
         var is_silent = false;
         var ignore_error = false;
-        var content = line;
+        var content = trimmed;
 
-        // Parse prefixes (can be @, ?, @?, ?@)
+        // Parse prefixes (can be @, ?, @?, ?@, $)
         while (content.len > 0) {
             if (content[0] == '@') {
                 is_silent = true;
@@ -492,12 +745,43 @@ pub const Parser = struct {
             } else if (content[0] == '?') {
                 ignore_error = true;
                 content = content[1..];
+            } else if (content[0] == '$') {
+                content = content[1..];
+                // Check if this is a multi-line marker ($ or @ alone, or just $)
+                const remaining = std.mem.trim(u8, content, " \t");
+                if (remaining.len == 0) {
+                    // This is a multi-line block marker
+                    self.state = .InMultilineScript;
+                    self.multiline_silent = is_silent;
+                    self.multiline_ignore_error = ignore_error;
+                    // Calculate the indent level for content lines
+                    // The content should be indented more than the current line
+                    self.multiline_indent = getIndentLevel(original_line) + 4; // Expect content indented by 4 more spaces
+                    return;
+                }
+                // Not a multi-line marker, $ is explicit shell prefix - process the rest
+                break;
             } else {
                 break;
             }
         }
 
+        // Check if @ alone indicates multi-line silent block
+        if (is_silent and !ignore_error and content.len == 0) {
+            // @ alone means silent multi-line block
+            self.state = .InMultilineScript;
+            self.multiline_silent = true;
+            self.multiline_ignore_error = false;
+            self.multiline_indent = getIndentLevel(original_line) + 4;
+            return;
+        }
+
         content = std.mem.trim(u8, content, " \t");
+
+        // Don't add empty content lines
+        if (content.len == 0) {
+            return;
+        }
 
         const script_line = try ScriptLine.init(self.allocator, content, is_silent, ignore_error);
         try self.current_task.?.addScriptLine(script_line);
@@ -507,6 +791,21 @@ pub const Parser = struct {
 /// Check if a line is indented
 fn isIndented(line: []const u8) bool {
     return line.len > 0 and (line[0] == ' ' or line[0] == '\t');
+}
+
+/// Get the indentation level of a line (number of leading spaces/tabs)
+fn getIndentLevel(line: []const u8) usize {
+    var indent: usize = 0;
+    for (line) |c| {
+        if (c == ' ') {
+            indent += 1;
+        } else if (c == '\t') {
+            indent += 4; // Treat tabs as 4 spaces
+        } else {
+            break;
+        }
+    }
+    return indent;
 }
 
 /// Extract description from text (finds text in quotes or after #)

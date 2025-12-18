@@ -1,5 +1,6 @@
 const std = @import("std");
 const ArrayList = std.ArrayList;
+const StringHashMap = std.StringHashMap;
 const Allocator = std.mem.Allocator;
 
 /// Represents a when: condition expression
@@ -8,6 +9,91 @@ pub const Condition = struct {
 
     pub fn deinit(self: *Condition, allocator: Allocator) void {
         allocator.free(self.expression);
+    }
+};
+
+/// Represents a matrix definition for parallel/combinatorial execution
+pub const Matrix = struct {
+    // Maps variable names to list of values
+    // e.g., "target" -> ["x86", "arm", "wasm"], "mode" -> ["debug", "release"]
+    variables: StringHashMap(ArrayList([]const u8)),
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator) Matrix {
+        return Matrix{
+            .variables = StringHashMap(ArrayList([]const u8)).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Matrix) void {
+        var it = self.variables.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items) |value| {
+                self.allocator.free(value);
+            }
+            entry.value_ptr.deinit(self.allocator);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.variables.deinit();
+    }
+
+    pub fn addVariable(self: *Matrix, name: []const u8, values: []const []const u8) !void {
+        var value_list: ArrayList([]const u8) = .empty;
+        for (values) |val| {
+            const val_copy = try self.allocator.dupe(u8, val);
+            try value_list.append(self.allocator, val_copy);
+        }
+        const name_copy = try self.allocator.dupe(u8, name);
+        try self.variables.put(name_copy, value_list);
+    }
+
+    /// Get all combinations of matrix variables
+    /// Returns list of variable maps, one for each combination
+    pub fn getCombinations(self: *const Matrix, allocator: Allocator) !ArrayList(StringHashMap([]const u8)) {
+        var combinations: ArrayList(StringHashMap([]const u8)) = .empty;
+
+        // If no variables, return empty list
+        if (self.variables.count() == 0) {
+            return combinations;
+        }
+
+        // Collect variable names and their value counts
+        var var_names: ArrayList([]const u8) = .empty;
+        defer var_names.deinit(allocator);
+
+        var value_lists: ArrayList([]const []const u8) = .empty;
+        defer value_lists.deinit(allocator);
+
+        var it = self.variables.iterator();
+        while (it.next()) |entry| {
+            try var_names.append(allocator, entry.key_ptr.*);
+            try value_lists.append(allocator, entry.value_ptr.items);
+        }
+
+        // Calculate total combinations
+        var total: usize = 1;
+        for (value_lists.items) |vl| {
+            total *= vl.len;
+        }
+
+        // Generate all combinations using indices
+        var combo_idx: usize = 0;
+        while (combo_idx < total) : (combo_idx += 1) {
+            var combo = StringHashMap([]const u8).init(allocator);
+            var remaining = combo_idx;
+
+            for (var_names.items, 0..) |var_name, i| {
+                const values = value_lists.items[i];
+                const value_idx = remaining % values.len;
+                remaining /= values.len;
+                try combo.put(var_name, values[value_idx]);
+            }
+
+            try combinations.append(allocator, combo);
+        }
+
+        return combinations;
     }
 };
 
@@ -21,6 +107,7 @@ pub const Task = struct {
     requires: ArrayList([]const u8), // Task dependencies
     aliases: ArrayList([]const u8), // Alternative task names
     condition: ?Condition, // Optional when: condition
+    matrix: ?Matrix, // Optional matrix for combinatorial execution
     target_os: TargetOS, // Which OS this task runs on
     allocator: Allocator,
 
@@ -34,6 +121,7 @@ pub const Task = struct {
             .requires = .empty,
             .aliases = .empty,
             .condition = null,
+            .matrix = null,
             .target_os = .any, // Default: runs on all platforms
             .allocator = allocator,
         };
@@ -73,6 +161,10 @@ pub const Task = struct {
         if (self.condition) |*cond| {
             var c = cond.*;
             c.deinit(self.allocator);
+        }
+
+        if (self.matrix) |*m| {
+            m.deinit();
         }
     }
 
@@ -117,6 +209,17 @@ pub const Task = struct {
         self.condition = Condition{
             .expression = try self.allocator.dupe(u8, expression),
         };
+    }
+
+    pub fn initMatrix(self: *Task) void {
+        if (self.matrix == null) {
+            self.matrix = Matrix.init(self.allocator);
+        }
+    }
+
+    pub fn addMatrixVariable(self: *Task, name: []const u8, values: []const []const u8) !void {
+        self.initMatrix();
+        try self.matrix.?.addVariable(name, values);
     }
 };
 
@@ -225,12 +328,23 @@ pub const ScriptLine = struct {
     content: []const u8,
     is_silent: bool, // true if prefixed with @
     ignore_error: bool, // true if prefixed with ?
+    is_multiline: bool, // true if this is a multi-line block
 
     pub fn init(allocator: Allocator, content: []const u8, is_silent: bool, ignore_error: bool) !ScriptLine {
         return ScriptLine{
             .content = try allocator.dupe(u8, content),
             .is_silent = is_silent,
             .ignore_error = ignore_error,
+            .is_multiline = false,
+        };
+    }
+
+    pub fn initMultiline(allocator: Allocator, content: []const u8, is_silent: bool, ignore_error: bool) !ScriptLine {
+        return ScriptLine{
+            .content = try allocator.dupe(u8, content),
+            .is_silent = is_silent,
+            .ignore_error = ignore_error,
+            .is_multiline = true,
         };
     }
 

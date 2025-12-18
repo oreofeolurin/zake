@@ -1,6 +1,7 @@
 const std = @import("std");
 const task_mod = @import("task.zig");
 const util = @import("util.zig");
+const stdlib = @import("stdlib.zig");
 const Task = task_mod.Task;
 const ScriptLine = task_mod.ScriptLine;
 const TargetOS = task_mod.TargetOS;
@@ -17,6 +18,23 @@ pub const VarMap = StringHashMap([]const u8);
 
 /// Maximum recursion depth for task invocations
 const MAX_RECURSION_DEPTH = 32;
+
+/// Errors that can occur during task execution
+const ExecutorError = error{
+    RecursionLimitExceeded,
+    DependencyNotFound,
+    InvalidLetStatement,
+    StdlibError,
+    NoRegistryForRun,
+    InvalidRunStatement,
+    TaskNotFound,
+    UnclosedVariable,
+    UnclosedEnvVar,
+    EnvVarNameTooLong,
+    UnclosedCommandSub,
+    ChildProcessFailed,
+    OutOfMemory,
+};
 
 /// Check if a task should execute on the current OS based on its arch: directive
 pub fn shouldExecuteOnCurrentOS(target: TargetOS) bool {
@@ -96,7 +114,32 @@ fn executeTaskInternal(
     registry: ?*const TaskRegistry,
     depth: usize,
     completed: *std.StringHashMap(void),
-) !u8 {
+) anyerror!u8 {
+    return executeTaskCore(allocator, task_ptr, vars, registry, depth, completed, false);
+}
+
+/// Execute task script only (for matrix expansion, skips matrix check)
+fn executeTaskScriptOnly(
+    allocator: Allocator,
+    task_ptr: *const Task,
+    vars: VarMap,
+    registry: ?*const TaskRegistry,
+    depth: usize,
+    completed: *std.StringHashMap(void),
+) anyerror!u8 {
+    return executeTaskCore(allocator, task_ptr, vars, registry, depth, completed, true);
+}
+
+/// Core task execution
+fn executeTaskCore(
+    allocator: Allocator,
+    task_ptr: *const Task,
+    vars: VarMap,
+    registry: ?*const TaskRegistry,
+    depth: usize,
+    completed: *std.StringHashMap(void),
+    skip_matrix: bool,
+) anyerror!u8 {
     if (depth >= MAX_RECURSION_DEPTH) {
         util.printError("Maximum task recursion depth ({d}) exceeded", .{MAX_RECURSION_DEPTH});
         return error.RecursionLimitExceeded;
@@ -108,6 +151,63 @@ fn executeTaskInternal(
         if (!satisfied) {
             util.printInfo("Skipping task '{s}' (condition not met)", .{task_ptr.name});
             return 0; // Skip silently without error
+        }
+    }
+
+    // Handle matrix execution - run task for each combination
+    if (!skip_matrix) {
+        if (task_ptr.matrix) |*matrix| {
+            var combinations = try matrix.getCombinations(allocator);
+            defer {
+                for (combinations.items) |*combo| {
+                    combo.deinit();
+                }
+                combinations.deinit(allocator);
+            }
+
+            if (combinations.items.len > 0) {
+                util.printInfo("Running matrix: {d} combination(s) for '{s}'", .{ combinations.items.len, task_ptr.name });
+
+                for (combinations.items, 0..) |combo, idx| {
+                    // Create vars with matrix values added
+                    var matrix_vars = VarMap.init(allocator);
+                    defer {
+                        var iter = matrix_vars.iterator();
+                        while (iter.next()) |entry| {
+                            allocator.free(entry.key_ptr.*);
+                            allocator.free(entry.value_ptr.*);
+                        }
+                        matrix_vars.deinit();
+                    }
+
+                    // Copy incoming vars
+                    var incoming_iter = vars.iterator();
+                    while (incoming_iter.next()) |entry| {
+                        const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
+                        errdefer allocator.free(key_copy);
+                        const value_copy = try allocator.dupe(u8, entry.value_ptr.*);
+                        try matrix_vars.put(key_copy, value_copy);
+                    }
+
+                    // Add matrix variables
+                    var combo_iter = combo.iterator();
+                    while (combo_iter.next()) |entry| {
+                        const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
+                        errdefer allocator.free(key_copy);
+                        const value_copy = try allocator.dupe(u8, entry.value_ptr.*);
+                        try matrix_vars.put(key_copy, value_copy);
+                    }
+
+                    util.printInfo("[{d}/{d}] {s}", .{ idx + 1, combinations.items.len, task_ptr.name });
+
+                    // Execute task with these vars (skip matrix to avoid infinite recursion)
+                    const code = try executeTaskScriptOnly(allocator, task_ptr, matrix_vars, registry, depth, completed);
+                    if (code != 0) {
+                        return code;
+                    }
+                }
+                return 0;
+            }
         }
     }
 
@@ -201,8 +301,34 @@ fn executeTaskInternal(
             // Extract value (trim whitespace)
             const raw_value = std.mem.trim(u8, rest[eq_pos + 1 ..], " \t");
 
-            // Substitute variables in the value
-            const substituted_value = try substituteVariables(allocator, raw_value, local_vars);
+            // Substitute variables first
+            const substituted_raw = try substituteVariables(allocator, raw_value, local_vars);
+            defer allocator.free(substituted_raw);
+
+            // Check if value is a stdlib call
+            var final_value: []const u8 = undefined;
+            var owns_value = false;
+
+            if (stdlib.isStdlibCall(substituted_raw)) {
+                const result = try stdlib.executeStdlibCall(allocator, substituted_raw);
+                switch (result) {
+                    .string => |s| {
+                        final_value = s;
+                        owns_value = true;
+                    },
+                    .void_result => {
+                        final_value = try allocator.dupe(u8, "");
+                        owns_value = true;
+                    },
+                    .err => |e| {
+                        util.printError("Stdlib error in let: {s}", .{e});
+                        return error.StdlibError;
+                    },
+                }
+            } else {
+                final_value = try allocator.dupe(u8, substituted_raw);
+                owns_value = true;
+            }
 
             // Store in local_vars (overwrite if exists)
             const key_copy = try allocator.dupe(u8, var_name);
@@ -214,7 +340,12 @@ fn executeTaskInternal(
                 allocator.free(old.value);
             }
 
-            try local_vars.put(key_copy, substituted_value);
+            if (owns_value) {
+                try local_vars.put(key_copy, final_value);
+            } else {
+                const value_copy = try allocator.dupe(u8, final_value);
+                try local_vars.put(key_copy, value_copy);
+            }
             continue;
         }
 
@@ -293,6 +424,30 @@ fn executeTaskInternal(
             const code = try executeTaskInternal(allocator, target_task, run_vars, registry, depth + 1, completed);
             if (code != 0 and !script_line.ignore_error) {
                 return code;
+            }
+            continue;
+        }
+
+        // Check for stdlib calls: namespace.function(args) (unless explicit shell)
+        if (!is_explicit_shell and stdlib.isStdlibCall(content)) {
+            // Substitute variables first
+            const substituted = try substituteVariables(allocator, content, local_vars);
+            defer allocator.free(substituted);
+
+            const result = try stdlib.executeStdlibCall(allocator, substituted);
+            switch (result) {
+                .void_result => {},
+                .string => |s| {
+                    // String results from stdlib are typically used in let statements
+                    // For now, just free them if not captured
+                    allocator.free(s);
+                },
+                .err => |e| {
+                    if (!script_line.ignore_error) {
+                        util.printError("Stdlib error: {s}", .{e});
+                        return error.StdlibError;
+                    }
+                },
             }
             continue;
         }

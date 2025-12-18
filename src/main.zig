@@ -37,6 +37,9 @@ pub fn main() !void {
     var zakefile_parser = Parser.init(allocator);
     defer zakefile_parser.deinit();
 
+    // Set base directory for imports (directory containing the Zakefile)
+    zakefile_parser.setBaseDir(".");
+
     var registry = zakefile_parser.parse(zakefile_content) catch |err| {
         util.printError("Failed to parse Zakefile: {s}", .{@errorName(err)});
         std.process.exit(2);
