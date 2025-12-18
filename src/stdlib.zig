@@ -1,5 +1,6 @@
 const std = @import("std");
 const util = @import("util.zig");
+const main_mod = @import("main.zig");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const fs = std.fs;
@@ -60,6 +61,8 @@ pub fn executeStdlibCall(allocator: Allocator, call: []const u8) !StdlibResult {
         return executePath(allocator, function, args.items);
     } else if (std.mem.eql(u8, namespace, "str")) {
         return executeStr(allocator, function, args.items);
+    } else if (std.mem.eql(u8, namespace, "sys")) {
+        return executeSys(allocator, function, args.items);
     } else {
         return StdlibResult{ .err = "Unknown stdlib namespace" };
     }
@@ -91,7 +94,8 @@ pub fn isStdlibCall(line: []const u8) bool {
     return std.mem.eql(u8, namespace, "log") or
         std.mem.eql(u8, namespace, "fs") or
         std.mem.eql(u8, namespace, "path") or
-        std.mem.eql(u8, namespace, "str");
+        std.mem.eql(u8, namespace, "str") or
+        std.mem.eql(u8, namespace, "sys");
 }
 
 /// Parse comma-separated arguments, handling quoted strings
@@ -257,6 +261,64 @@ fn executePath(allocator: Allocator, function: []const u8, args: []const []const
         const ext = std.fs.path.extension(path);
         const result = allocator.dupe(u8, ext) catch return StdlibResult{ .err = "path.ext allocation failed" };
         return StdlibResult{ .string = result };
+    } else if (std.mem.eql(u8, function, "last")) {
+        // Get last N path components
+        // Usage: zake::path.last(N) -> uses original pwd (where zake was invoked)
+        //        zake::path.last(path, N) -> uses provided path
+        const count_arg_idx: usize = if (args.len == 1) 0 else if (args.len == 2) 1 else {
+            return StdlibResult{ .err = "path.last requires 1 or 2 arguments" };
+        };
+
+        const count_str = args[count_arg_idx];
+        const count = std.fmt.parseInt(usize, count_str, 10) catch {
+            return StdlibResult{ .err = "path.last count must be a number" };
+        };
+
+        // Get the path to process
+        const path_to_process = if (args.len == 1) blk: {
+            // Use original working directory (where zake was invoked)
+            break :blk main_mod.original_invoke_dir;
+        } else args[0];
+
+        // Split path and get last N components
+        var components: ArrayList([]const u8) = .empty;
+        defer components.deinit(allocator);
+
+        var path_iter = std.mem.splitScalar(u8, path_to_process, '/');
+        while (path_iter.next()) |component| {
+            if (component.len > 0) {
+                components.append(allocator, component) catch {
+                    return StdlibResult{ .err = "path.last allocation failed" };
+                };
+            }
+        }
+
+        if (components.items.len >= count) {
+            const start_idx = components.items.len - count;
+            const result_parts = components.items[start_idx..];
+
+            // Join with /
+            var result: ArrayList(u8) = .empty;
+            defer result.deinit(allocator);
+
+            for (result_parts, 0..) |part, i| {
+                if (i > 0) result.append(allocator, '/') catch {
+                    return StdlibResult{ .err = "path.last allocation failed" };
+                };
+                result.appendSlice(allocator, part) catch {
+                    return StdlibResult{ .err = "path.last allocation failed" };
+                };
+            }
+
+            const final = result.toOwnedSlice(allocator) catch {
+                return StdlibResult{ .err = "path.last allocation failed" };
+            };
+            return StdlibResult{ .string = final };
+        } else {
+            // Not enough components, return full path
+            const result = allocator.dupe(u8, path_to_process) catch return StdlibResult{ .err = "path.last allocation failed" };
+            return StdlibResult{ .string = result };
+        }
     } else {
         return StdlibResult{ .err = "Unknown path function" };
     }
@@ -321,5 +383,18 @@ fn executeStr(allocator: Allocator, function: []const u8, args: []const []const 
         return StdlibResult{ .string = if (contains) "true" else "false" };
     } else {
         return StdlibResult{ .err = "Unknown str function" };
+    }
+}
+
+/// Execute sys namespace functions (pwd, getcwd, etc.)
+fn executeSys(allocator: Allocator, function: []const u8, args: [][]const u8) StdlibResult {
+    _ = args; // Currently unused but may be needed for future sys functions
+    
+    if (std.mem.eql(u8, function, "pwd")) {
+        // Get original working directory (where zake was invoked, not where Zakefile is)
+        const result = allocator.dupe(u8, main_mod.original_invoke_dir) catch return StdlibResult{ .err = "sys.pwd allocation failed" };
+        return StdlibResult{ .string = result };
+    } else {
+        return StdlibResult{ .err = "Unknown sys function" };
     }
 }

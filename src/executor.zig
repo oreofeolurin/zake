@@ -83,6 +83,86 @@ fn evaluateCondition(allocator: Allocator, expression: []const u8, vars: VarMap)
 
     return true;
 }
+
+/// Evaluate an expression with operators: ||, ??
+/// Returns the first truthy value for ||, first non-empty for ??
+/// Also handles function calls and variable substitution
+fn evaluateExpression(allocator: Allocator, expression: []const u8, vars: VarMap) ![]const u8 {
+    const trimmed = std.mem.trim(u8, expression, " \t");
+
+    // Check for || operator (logical OR - first truthy value)
+    if (std.mem.indexOf(u8, trimmed, "||")) |op_pos| {
+        const left_expr = std.mem.trim(u8, trimmed[0..op_pos], " \t");
+        const right_expr = std.mem.trim(u8, trimmed[op_pos + 2 ..], " \t");
+
+        // Evaluate left side
+        const left_value = try evaluateSingleValue(allocator, left_expr, vars);
+        defer allocator.free(left_value);
+
+        // If left is truthy (non-empty), return it
+        const left_trimmed = std.mem.trim(u8, left_value, " \t");
+        if (left_trimmed.len > 0) {
+            return allocator.dupe(u8, left_value);
+        }
+
+        // Otherwise evaluate and return right side
+        return evaluateExpression(allocator, right_expr, vars);
+    }
+
+    // Check for ?? operator (nullish coalescing - first non-empty)
+    if (std.mem.indexOf(u8, trimmed, "??")) |op_pos| {
+        const left_expr = std.mem.trim(u8, trimmed[0..op_pos], " \t");
+        const right_expr = std.mem.trim(u8, trimmed[op_pos + 2 ..], " \t");
+
+        // Evaluate left side
+        const left_value = try evaluateSingleValue(allocator, left_expr, vars);
+        defer allocator.free(left_value);
+
+        // If left is non-empty, return it
+        const left_trimmed = std.mem.trim(u8, left_value, " \t");
+        if (left_trimmed.len > 0) {
+            return allocator.dupe(u8, left_value);
+        }
+
+        // Otherwise evaluate and return right side
+        return evaluateExpression(allocator, right_expr, vars);
+    }
+
+    // No operators - evaluate single value
+    return evaluateSingleValue(allocator, trimmed, vars);
+}
+
+/// Evaluate a single value (no operators)
+/// Handles: variable substitution, stdlib calls, string literals
+fn evaluateSingleValue(allocator: Allocator, value: []const u8, vars: VarMap) ![]const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t");
+
+    // Check if it's a stdlib call BEFORE substitution
+    if (stdlib.isStdlibCall(trimmed)) {
+        const result = try stdlib.executeStdlibCall(allocator, trimmed);
+        return switch (result) {
+            .string => |s| s,
+            .void_result => try allocator.dupe(u8, ""),
+            .err => |e| {
+                util.printError("Stdlib error: {s}", .{e});
+                return error.StdlibError;
+            },
+        };
+    }
+
+    // Substitute variables
+    const substituted = try substituteVariables(allocator, trimmed, vars);
+
+    // Remove surrounding quotes if present
+    if (substituted.len >= 2 and substituted[0] == '"' and substituted[substituted.len - 1] == '"') {
+        const unquoted = try allocator.dupe(u8, substituted[1 .. substituted.len - 1]);
+        allocator.free(substituted);
+        return unquoted;
+    }
+
+    return substituted;
+}
+
 /// Execute a task with given variable bindings
 /// registry is optional - only needed if task uses 'run' command
 pub fn executeTask(allocator: Allocator, task_ptr: *const Task, vars: VarMap) !u8 {
@@ -301,34 +381,9 @@ fn executeTaskCore(
             // Extract value (trim whitespace)
             const raw_value = std.mem.trim(u8, rest[eq_pos + 1 ..], " \t");
 
-            // Substitute variables first
-            const substituted_raw = try substituteVariables(allocator, raw_value, local_vars);
-            defer allocator.free(substituted_raw);
-
-            // Check if value is a stdlib call
-            var final_value: []const u8 = undefined;
-            var owns_value = false;
-
-            if (stdlib.isStdlibCall(substituted_raw)) {
-                const result = try stdlib.executeStdlibCall(allocator, substituted_raw);
-                switch (result) {
-                    .string => |s| {
-                        final_value = s;
-                        owns_value = true;
-                    },
-                    .void_result => {
-                        final_value = try allocator.dupe(u8, "");
-                        owns_value = true;
-                    },
-                    .err => |e| {
-                        util.printError("Stdlib error in let: {s}", .{e});
-                        return error.StdlibError;
-                    },
-                }
-            } else {
-                final_value = try allocator.dupe(u8, substituted_raw);
-                owns_value = true;
-            }
+            // Evaluate expression (handles ||, ??, function calls, etc.)
+            const evaluated_value = try evaluateExpression(allocator, raw_value, local_vars);
+            defer allocator.free(evaluated_value);
 
             // Store in local_vars (overwrite if exists)
             const key_copy = try allocator.dupe(u8, var_name);
@@ -340,12 +395,8 @@ fn executeTaskCore(
                 allocator.free(old.value);
             }
 
-            if (owns_value) {
-                try local_vars.put(key_copy, final_value);
-            } else {
-                const value_copy = try allocator.dupe(u8, final_value);
-                try local_vars.put(key_copy, value_copy);
-            }
+            const value_copy = try allocator.dupe(u8, evaluated_value);
+            try local_vars.put(key_copy, value_copy);
             continue;
         }
 

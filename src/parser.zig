@@ -108,6 +108,15 @@ pub const Parser = struct {
         // Handle multi-line script accumulation
         if (self.state == .InMultilineScript) {
             // Check if this line is still part of the multi-line block
+            // Allow blank lines within the block
+            if (trimmed.len == 0) {
+                // Blank line - add it to preserve formatting
+                if (self.multiline_buffer.items.len > 0) {
+                    try self.multiline_buffer.append(self.allocator, '\n');
+                }
+                return;
+            }
+
             // It must be indented at least as much as the content start
             if (isIndented(line)) {
                 const indent = getIndentLevel(line);
@@ -125,7 +134,7 @@ pub const Parser = struct {
                     return;
                 }
             }
-            // Line is not indented enough or empty - finalize the multi-line block
+            // Line is not indented enough - finalize the multi-line block
             try self.finalizeMultilineBlock();
             // Fall through to process this line normally
         }
@@ -416,7 +425,7 @@ pub const Parser = struct {
                 try self.registry.global_vars.put(key_copy, value_copy);
             }
         }
-        
+
         // Now safe to let sub_parser deinit - tasks have been moved out
     }
 
@@ -607,12 +616,12 @@ pub const Parser = struct {
         const arg_name = content[start_bracket + 1 .. start_bracket + end_bracket];
 
         // Find [type], [type?], or [type="default"]
-        const type_start = std.mem.indexOf(u8, content[start_bracket + end_bracket..], "[") orelse {
+        const type_start = std.mem.indexOf(u8, content[start_bracket + end_bracket ..], "[") orelse {
             std.debug.print("Error at line {d}: Argument missing [type]\n", .{self.line_number});
             return error.InvalidArgumentSyntax;
         };
 
-        const type_end = std.mem.indexOf(u8, content[start_bracket + end_bracket + type_start..], "]") orelse {
+        const type_end = std.mem.indexOf(u8, content[start_bracket + end_bracket + type_start ..], "]") orelse {
             std.debug.print("Error at line {d}: Argument missing closing ]\n", .{self.line_number});
             return error.InvalidArgumentSyntax;
         };
@@ -677,7 +686,7 @@ pub const Parser = struct {
             return error.InvalidFlagSyntax;
         };
 
-        const type_end = std.mem.indexOf(u8, content[search_start + type_start..], "]") orelse {
+        const type_end = std.mem.indexOf(u8, content[search_start + type_start ..], "]") orelse {
             std.debug.print("Error at line {d}: Flag missing closing ]\n", .{self.line_number});
             return error.InvalidFlagSyntax;
         };

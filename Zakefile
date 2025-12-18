@@ -121,3 +121,25 @@ hello-config:
             else
                 echo "Hello, {{name}}!"
             fi
+
+## Test let expressions with || operator
+test-let:
+    arg: <value> [string?] "Optional value"
+    script:
+        let result = {{value}} || "default-value"
+        let nullish = {{value}} ?? "nullish-default"
+        echo "Result with ||: {{result}}"
+        echo "Result with ??: {{nullish}}"
+
+## Test let with path.last
+test-relpath:
+    arg: <component> [string?] "Optional component path"
+    script:
+        zake::log.info("Testing stdlib call detection")
+        let comp = {{component}} || zake::path.last("2")
+        let direct = zake::path.last("2")
+        let explicit = zake::path.last("/home/user/projects/myapp/services/gateway", "3")
+        echo "Component: {{comp}}"
+        echo "Direct call: {{direct}}"
+        echo "Explicit path: {{explicit}}"
+        echo "Current directory: $(pwd)"

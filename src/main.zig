@@ -9,10 +9,20 @@ const Parser = parser_mod.Parser;
 const TaskRegistry = task_mod.TaskRegistry;
 const VarMap = executor_mod.VarMap;
 
+/// Original directory where zake was invoked (before chdir to Zakefile location)
+pub var original_invoke_dir: []const u8 = ".";
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    // Capture original working directory before any chdir
+    // Store it globally so stdlib can access it
+    var original_cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const original_cwd = std.fs.cwd().realpath(".", &original_cwd_buf) catch ".";
+    original_invoke_dir = try allocator.dupe(u8, original_cwd);
+    defer allocator.free(original_invoke_dir);
 
     // Get command line arguments
     const args = try std.process.argsAlloc(allocator);
