@@ -76,19 +76,117 @@ fn evaluateCondition(allocator: Allocator, expression: []const u8, vars: VarMap)
     // No comparison - treat as truthy check
     // Empty, "false", "0", "no" are falsy
     const trimmed = std.mem.trim(u8, expanded, " \t\"");
+    return isTruthy(trimmed);
+}
+
+/// Check if a value is "truthy" (non-empty, not "false", not "0", not "no")
+fn isTruthy(value: []const u8) bool {
+    const trimmed = std.mem.trim(u8, value, " \t\"");
     if (trimmed.len == 0) return false;
     if (std.mem.eql(u8, trimmed, "false")) return false;
     if (std.mem.eql(u8, trimmed, "0")) return false;
     if (std.mem.eql(u8, trimmed, "no")) return false;
-
     return true;
 }
 
-/// Evaluate an expression with operators: ||, ??
+/// Find the position of the ternary '?' operator, skipping those inside quotes/parens
+fn findTernaryOperator(expr: []const u8) ?usize {
+    var in_quotes = false;
+    var paren_depth: usize = 0;
+    var i: usize = 0;
+
+    while (i < expr.len) : (i += 1) {
+        const c = expr[i];
+
+        if (c == '"' and (i == 0 or expr[i - 1] != '\\')) {
+            in_quotes = !in_quotes;
+        } else if (!in_quotes) {
+            if (c == '(') {
+                paren_depth += 1;
+            } else if (c == ')') {
+                if (paren_depth > 0) paren_depth -= 1;
+            } else if (c == '?' and paren_depth == 0) {
+                // Make sure it's not ?? (nullish coalescing)
+                if (i + 1 < expr.len and expr[i + 1] == '?') {
+                    i += 1; // Skip the second ?
+                    continue;
+                }
+                return i;
+            }
+        }
+    }
+    return null;
+}
+
+/// Find the matching ':' for a ternary operator (after the '?')
+fn findColonForTernary(expr: []const u8) ?usize {
+    var in_quotes = false;
+    var paren_depth: usize = 0;
+    var ternary_depth: usize = 0;
+    var i: usize = 0;
+
+    while (i < expr.len) : (i += 1) {
+        const c = expr[i];
+
+        if (c == '"' and (i == 0 or expr[i - 1] != '\\')) {
+            in_quotes = !in_quotes;
+        } else if (!in_quotes) {
+            if (c == '(') {
+                paren_depth += 1;
+            } else if (c == ')') {
+                if (paren_depth > 0) paren_depth -= 1;
+            } else if (c == '?' and paren_depth == 0) {
+                // Nested ternary - skip ??
+                if (i + 1 < expr.len and expr[i + 1] == '?') {
+                    i += 1;
+                    continue;
+                }
+                ternary_depth += 1;
+            } else if (c == ':' and paren_depth == 0) {
+                if (ternary_depth == 0) {
+                    return i;
+                }
+                ternary_depth -= 1;
+            }
+        }
+    }
+    return null;
+}
+
+/// Evaluate an expression with operators: ||, ??, and ternary (? :)
 /// Returns the first truthy value for ||, first non-empty for ??
+/// For ternary: condition ? true_value : false_value (like JavaScript)
 /// Also handles function calls and variable substitution
-fn evaluateExpression(allocator: Allocator, expression: []const u8, vars: VarMap) ![]const u8 {
+fn evaluateExpression(allocator: Allocator, expression: []const u8, vars: VarMap, registry: ?*const TaskRegistry) ![]const u8 {
     const trimmed = std.mem.trim(u8, expression, " \t");
+
+    // Check for ternary operator (condition ? true_val : false_val) - must check BEFORE ||
+    // Need to find ? that's not inside quotes or parens
+    if (findTernaryOperator(trimmed)) |q_pos| {
+        // Find the matching : for this ?
+        const after_q = trimmed[q_pos + 1 ..];
+        if (findColonForTernary(after_q)) |colon_offset| {
+            const colon_pos = q_pos + 1 + colon_offset;
+
+            const condition_expr = std.mem.trim(u8, trimmed[0..q_pos], " \t");
+            const true_expr = std.mem.trim(u8, trimmed[q_pos + 1 .. colon_pos], " \t");
+            const false_expr = std.mem.trim(u8, trimmed[colon_pos + 1 ..], " \t");
+
+            // Evaluate condition
+            const condition_value = try evaluateSingleValue(allocator, condition_expr, vars, registry);
+            defer allocator.free(condition_value);
+
+            // Check if condition is truthy
+            const is_truthy = isTruthy(condition_value);
+
+            // Evaluate and return appropriate branch
+            if (is_truthy) {
+                return evaluateExpression(allocator, true_expr, vars, registry);
+            } else {
+                return evaluateExpression(allocator, false_expr, vars, registry);
+            }
+        }
+    }
 
     // Check for || operator (logical OR - first truthy value)
     if (std.mem.indexOf(u8, trimmed, "||")) |op_pos| {
@@ -96,7 +194,7 @@ fn evaluateExpression(allocator: Allocator, expression: []const u8, vars: VarMap
         const right_expr = std.mem.trim(u8, trimmed[op_pos + 2 ..], " \t");
 
         // Evaluate left side
-        const left_value = try evaluateSingleValue(allocator, left_expr, vars);
+        const left_value = try evaluateSingleValue(allocator, left_expr, vars, registry);
         defer allocator.free(left_value);
 
         // If left is truthy (non-empty), return it
@@ -106,7 +204,7 @@ fn evaluateExpression(allocator: Allocator, expression: []const u8, vars: VarMap
         }
 
         // Otherwise evaluate and return right side
-        return evaluateExpression(allocator, right_expr, vars);
+        return evaluateExpression(allocator, right_expr, vars, registry);
     }
 
     // Check for ?? operator (nullish coalescing - first non-empty)
@@ -115,7 +213,7 @@ fn evaluateExpression(allocator: Allocator, expression: []const u8, vars: VarMap
         const right_expr = std.mem.trim(u8, trimmed[op_pos + 2 ..], " \t");
 
         // Evaluate left side
-        const left_value = try evaluateSingleValue(allocator, left_expr, vars);
+        const left_value = try evaluateSingleValue(allocator, left_expr, vars, registry);
         defer allocator.free(left_value);
 
         // If left is non-empty, return it
@@ -125,21 +223,31 @@ fn evaluateExpression(allocator: Allocator, expression: []const u8, vars: VarMap
         }
 
         // Otherwise evaluate and return right side
-        return evaluateExpression(allocator, right_expr, vars);
+        return evaluateExpression(allocator, right_expr, vars, registry);
     }
 
     // No operators - evaluate single value
-    return evaluateSingleValue(allocator, trimmed, vars);
+    return evaluateSingleValue(allocator, trimmed, vars, registry);
 }
 
 /// Evaluate a single value (no operators)
 /// Handles: variable substitution, stdlib calls, string literals
-fn evaluateSingleValue(allocator: Allocator, value: []const u8, vars: VarMap) ![]const u8 {
+fn evaluateSingleValue(allocator: Allocator, value: []const u8, vars: VarMap, registry: ?*const TaskRegistry) ![]const u8 {
     const trimmed = std.mem.trim(u8, value, " \t");
+
+    // Handle zake::run() specially - executes task and returns exit code
+    if (std.mem.startsWith(u8, trimmed, "zake::run(")) {
+        return executeZakeRun(allocator, trimmed, vars, registry, false);
+    }
+
+    // Handle zake::exec() - executes task and captures stdout
+    if (std.mem.startsWith(u8, trimmed, "zake::exec(")) {
+        return executeZakeRun(allocator, trimmed, vars, registry, true);
+    }
 
     // Check if it's a stdlib call BEFORE substitution
     if (stdlib.isStdlibCall(trimmed)) {
-        const result = try stdlib.executeStdlibCall(allocator, trimmed);
+        const result = try stdlib.executeStdlibCall(allocator, trimmed, vars, @ptrCast(registry));
         return switch (result) {
             .string => |s| s,
             .void_result => try allocator.dupe(u8, ""),
@@ -164,6 +272,181 @@ fn evaluateSingleValue(allocator: Allocator, value: []const u8, vars: VarMap) ![
 }
 
 /// Execute a task with given variable bindings
+/// Execute zake::run(task_name, args...) or zake::exec(task_name, args...)
+/// If capture_output is true, captures stdout; otherwise returns exit code
+fn executeZakeRun(allocator: Allocator, call: []const u8, vars: VarMap, registry: ?*const TaskRegistry, capture_output: bool) ![]const u8 {
+    _ = vars; // Not used for now, but could be used to pass variables
+
+    if (registry == null) {
+        util.printError("zake::run requires registry context", .{});
+        return error.StdlibError;
+    }
+
+    // Parse: zake::run(task_name, arg1, arg2, ...) or zake::exec(...)
+    const prefix = if (capture_output) "zake::exec(" else "zake::run(";
+    if (!std.mem.startsWith(u8, call, prefix)) {
+        return error.InvalidSyntax;
+    }
+
+    const close_paren = std.mem.lastIndexOf(u8, call, ")") orelse {
+        util.printError("zake::run: missing closing parenthesis", .{});
+        return error.InvalidSyntax;
+    };
+
+    const args_str = call[prefix.len..close_paren];
+
+    // Parse arguments (task name and optional args)
+    var args = stdlib.parseArgs(allocator, args_str) catch {
+        util.printError("zake::run: failed to parse arguments", .{});
+        return error.InvalidSyntax;
+    };
+    defer {
+        for (args.items) |arg| allocator.free(arg);
+        args.deinit(allocator);
+    }
+
+    if (args.items.len == 0) {
+        util.printError("zake::run requires at least a task name", .{});
+        return error.InvalidSyntax;
+    }
+
+    const task_name = args.items[0];
+
+    // Find the task
+    const task = registry.?.findTask(task_name) orelse {
+        util.printError("zake::run: task '{s}' not found", .{task_name});
+        return error.TaskNotFound;
+    };
+
+    // Build vars for the task (remaining args as positional arguments)
+    var task_vars = VarMap.init(allocator);
+    defer {
+        var iter = task_vars.iterator();
+        while (iter.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        task_vars.deinit();
+    }
+
+    // Map positional arguments to task argument names
+    var arg_idx: usize = 1; // Start after task name
+    for (task.arguments.items) |task_arg| {
+        if (arg_idx < args.items.len) {
+            const key = try allocator.dupe(u8, task_arg.name);
+            const val = try allocator.dupe(u8, args.items[arg_idx]);
+            try task_vars.put(key, val);
+            arg_idx += 1;
+        } else if (!task_arg.is_optional) {
+            util.printError("zake::run: missing required argument '{s}' for task '{s}'", .{ task_arg.name, task_name });
+            return error.MissingArgument;
+        }
+    }
+
+    if (capture_output) {
+        // For run_capture, we execute the task's script and capture stdout
+        // Build a shell script from the task's script lines and execute it
+        return executeTaskCaptureOutput(allocator, task, task_vars, registry);
+    } else {
+        // For run, execute normally and return exit code
+        var completed = std.StringHashMap(void).init(allocator);
+        defer {
+            var it = completed.keyIterator();
+            while (it.next()) |key| allocator.free(key.*);
+            completed.deinit();
+        }
+
+        const exit_code = executeTaskInternal(allocator, task, task_vars, registry, 0, &completed) catch |err| {
+            util.printError("zake::run: task '{s}' failed: {s}", .{ task.name, @errorName(err) });
+            return error.TaskFailed;
+        };
+
+        var buf: [16]u8 = undefined;
+        const code_str = std.fmt.bufPrint(&buf, "{d}", .{exit_code}) catch "0";
+        return allocator.dupe(u8, code_str);
+    }
+}
+
+/// Execute a task and capture its stdout output
+/// Used by zake::exec() to get output from tasks
+fn executeTaskCaptureOutput(allocator: Allocator, task: *const Task, vars: VarMap, registry: ?*const TaskRegistry) ![]const u8 {
+    _ = registry; // May be used for nested runs later
+
+    // Build a combined shell script from all script lines
+    var script_builder: std.ArrayList(u8) = .empty;
+    defer script_builder.deinit(allocator);
+
+    // Add variable exports
+    var var_iter = vars.iterator();
+    while (var_iter.next()) |entry| {
+        try script_builder.appendSlice(allocator, entry.key_ptr.*);
+        try script_builder.appendSlice(allocator, "='");
+        // Escape single quotes in value
+        for (entry.value_ptr.*) |c| {
+            if (c == '\'') {
+                try script_builder.appendSlice(allocator, "'\\''");
+            } else {
+                try script_builder.append(allocator, c);
+            }
+        }
+        try script_builder.appendSlice(allocator, "'\n");
+    }
+
+    // Process script lines - only include @ silent commands (output capture)
+    for (task.script_lines.items) |script_line| {
+        const content = script_line.content;
+
+        // Only capture output from @ prefixed (silent) commands
+        const is_silent = script_line.is_silent;
+        if (!is_silent) continue;
+
+        // Substitute variables in the content
+        const substituted = try substituteVariables(allocator, content, vars);
+        defer allocator.free(substituted);
+
+        try script_builder.appendSlice(allocator, substituted);
+        try script_builder.append(allocator, '\n');
+    }
+
+    if (script_builder.items.len == 0) {
+        // No silent commands to capture - return empty string
+        return allocator.dupe(u8, "");
+    }
+
+    const script = try script_builder.toOwnedSlice(allocator);
+    defer allocator.free(script);
+
+    // Execute the script and capture output
+    var child = std.process.Child.init(&[_][]const u8{ "sh", "-c", script }, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Inherit;
+
+    try child.spawn();
+
+    const output = try child.stdout.?.readToEndAlloc(allocator, 1024 * 1024); // 1MB max
+
+    const term = try child.wait();
+    if (term.Exited != 0) {
+        allocator.free(output);
+        return error.TaskFailed;
+    }
+
+    // Trim trailing newline
+    var result = output;
+    while (result.len > 0 and (result[result.len - 1] == '\n' or result[result.len - 1] == '\r')) {
+        result = result[0 .. result.len - 1];
+    }
+
+    if (result.len != output.len) {
+        const trimmed = try allocator.dupe(u8, result);
+        allocator.free(output);
+        return trimmed;
+    }
+
+    return output;
+}
+
+/// Execute a task, returning exit code
 /// registry is optional - only needed if task uses 'run' command
 pub fn executeTask(allocator: Allocator, task_ptr: *const Task, vars: VarMap) !u8 {
     var completed = std.StringHashMap(void).init(allocator);
@@ -382,7 +665,7 @@ fn executeTaskCore(
             const raw_value = std.mem.trim(u8, rest[eq_pos + 1 ..], " \t");
 
             // Evaluate expression (handles ||, ??, function calls, etc.)
-            const evaluated_value = try evaluateExpression(allocator, raw_value, local_vars);
+            const evaluated_value = try evaluateExpression(allocator, raw_value, local_vars, registry);
             defer allocator.free(evaluated_value);
 
             // Store in local_vars (overwrite if exists)
@@ -407,7 +690,10 @@ fn executeTaskCore(
                 return error.NoRegistryForRun;
             }
 
-            const rest = std.mem.trim(u8, content[4..], " \t"); // Skip "run "
+            const rest_raw = std.mem.trim(u8, content[4..], " \t"); // Skip "run "
+            // Substitute variables in the run arguments
+            const rest = try substituteVariables(allocator, rest_raw, local_vars);
+            defer allocator.free(rest);
 
             // Parse task name and arguments
             var parts = std.mem.splitScalar(u8, rest, ' ');
@@ -481,11 +767,8 @@ fn executeTaskCore(
 
         // Check for stdlib calls: namespace.function(args) (unless explicit shell)
         if (!is_explicit_shell and stdlib.isStdlibCall(content)) {
-            // Substitute variables first
-            const substituted = try substituteVariables(allocator, content, local_vars);
-            defer allocator.free(substituted);
-
-            const result = try stdlib.executeStdlibCall(allocator, substituted);
+            // Don't substitute variables - stdlib will resolve args from local_vars
+            const result = try stdlib.executeStdlibCall(allocator, content, local_vars, @ptrCast(registry));
             switch (result) {
                 .void_result => {},
                 .string => |s| {

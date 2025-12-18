@@ -2,9 +2,9 @@
 # import "build.zake"  # Uncomment if you have additional build tasks
 
 # Global variables
-#APP_NAME = my-awesome-app
-#VERSION = 1.0.0
-#BUILD_DIR = dist
+APP_NAME = my-awesome-app
+VERSION = 1.0.0
+BUILD_DIR = dist
 
 ## Build the project
 build:
@@ -143,3 +143,133 @@ test-relpath:
         echo "Direct call: {{direct}}"
         echo "Explicit path: {{explicit}}"
         echo "Current directory: $(pwd)"
+
+## Test sys.env function
+test-env:
+    script:
+        let home = zake::sys.env("HOME")
+        let missing = zake::sys.env("NONEXISTENT_VAR", "default-value")
+        let user = zake::sys.env("USER", "unknown")
+        echo "HOME: {{home}}"
+        echo "MISSING with default: {{missing}}"
+        echo "USER: {{user}}"
+
+## Test ternary expressions (JavaScript-style)
+test-ternary:
+    arg: <value> [string?] "Optional value"
+    script:
+        let has_value = {{value}} ? "yes" : "no"
+        let result = {{value}} ? {{value}} : "default"
+        echo "Has value: {{has_value}}"
+        echo "Result: {{result}}"
+
+## Test str.is_empty
+test-is-empty:
+    arg: <value> [string?] "Optional value"
+    script:
+        let empty_check = zake::str.is_empty("{{value}}")
+        let whitespace = zake::str.is_empty("   ")
+        let not_empty = zake::str.is_empty("hello")
+        echo "Is '{{value}}' empty: {{empty_check}}"
+        echo "Is '   ' empty: {{whitespace}}"
+        echo "Is 'hello' empty: {{not_empty}}"
+
+## Test json functions
+test-json:
+    script:
+        let name = zake::json.get("{\"name\":\"Alice\",\"age\":\"30\"}", "name")
+        let has_name = zake::json.has("{\"name\":\"Alice\",\"age\":\"30\"}", "name")
+        let has_missing = zake::json.has("{\"name\":\"Alice\",\"age\":\"30\"}", "missing")
+        let updated = zake::json.set("{\"name\":\"Alice\"}", "city", "NYC")
+        let deleted = zake::json.delete("{\"name\":\"Alice\",\"age\":\"30\"}", "age")
+        let keys = zake::json.keys("{\"name\":\"Alice\",\"age\":\"30\"}")
+        echo "Name: {{name}}"
+        echo "Has name: {{has_name}}"
+        echo "Has missing: {{has_missing}}"
+        echo "Updated: {{updated}}"
+        echo "Deleted age: {{deleted}}"
+        echo "Keys: {{keys}}"
+
+## Test json functions with unquoted variable syntax
+test-json-vars:
+    script:
+        # Create some test data
+        let json_data = {"name":"Bob","age":"25"}
+        let key_name = name
+        let key_age = age
+        let new_value = NYC
+        
+        # Use unquoted variables in stdlib calls
+        let got_name = zake::json.get(json_data, key_name)
+        let has_key = zake::json.has(json_data, key_age)
+        let updated = zake::json.set(json_data, "city", new_value)
+        let deleted = zake::json.delete(json_data, key_age)
+        
+        echo "Got name using variable: {{got_name}}"
+        echo "Has age key: {{has_key}}"
+        echo "Updated JSON: {{updated}}"
+        echo "After delete: {{deleted}}"
+
+## Test interactive io (uncomment to test manually)
+# test-io:
+#     script:
+#         let name = zake::io.prompt("Enter your name: ")
+#         let confirmed = zake::io.confirm("Continue?")
+#         echo "Hello, {{name}}! Confirmed: {{confirmed}}"
+
+# Hidden task (function-like) - won't appear in 'zake' listings
+_greet:
+    arg: <name> [string] "Name to greet"
+    script:
+        echo "Hello, {{name}}!"
+
+# Hidden helper - outputs result
+_add:
+    arg: <a> [string] "First number"
+    arg: <b> [string] "Second number"
+    script:
+        @expr {{a}} + {{b}}
+
+# Hidden helper - returns a value
+_get_greeting:
+    arg: <name> [string] "Name to greet"
+    script:
+        @echo "Hello, {{name}}!"
+
+## Test zake::run to call another task (returns exit code)
+test-run:
+    script:
+        echo "Testing zake::run..."
+        let result = zake::run("_greet", "World")
+        echo "Run result (exit code): {{result}}"
+
+## Test zake::exec to capture output from a task
+test-exec:
+    script:
+        echo "Testing zake::exec..."
+        let sum = zake::exec("_add", "5", "3")
+        echo "5 + 3 = {{sum}}"
+        let greeting = zake::exec("_get_greeting", "Alice")
+        echo "Greeting: {{greeting}}"
+
+## Test optional end marker for multi-line shell blocks
+test-endmarker:
+    script:
+        echo "Testing optional end markers..."
+        
+        # Style 1: With explicit end marker
+        @
+            echo "Block 1: With end marker"
+            X=42
+            echo "X is $X"
+        @
+        
+        echo "Between blocks"
+        
+        # Style 2: Without end marker (indentation-based)
+        @
+            echo "Block 2: Without end marker"
+            Y=99
+            echo "Y is $Y"
+        
+        echo "After blocks - done!"

@@ -41,10 +41,20 @@ pub fn printOverview(registry: *const TaskRegistry) !void {
     defer commands.deinit();
 
     for (registry.tasks.items) |*t| {
+        // Skip hidden tasks (names starting with _)
+        if (t.name.len > 0 and t.name[0] == '_') {
+            continue;
+        }
+
         // Check if task name contains a dot (is a subcommand)
         if (std.mem.indexOf(u8, t.name, ".")) |dot_pos| {
             // Extract the group prefix (e.g., "secrets" from "secrets.view")
             const group_name = t.name[0..dot_pos];
+
+            // Skip if group name starts with _
+            if (group_name.len > 0 and group_name[0] == '_') {
+                continue;
+            }
 
             const existing = commands.get(group_name);
             if (existing == null) {
@@ -214,12 +224,22 @@ pub fn printCommandGroupHelp(registry: *const TaskRegistry, group_name: []const 
     const prefix_with_dot_len = group_name.len + 1;
 
     for (registry.tasks.items) |*t| {
+        // Skip hidden tasks (names starting with _)
+        if (t.name.len > 0 and t.name[0] == '_') {
+            continue;
+        }
+
         if (std.mem.startsWith(u8, t.name, group_name) and
             t.name.len > group_name.len and
             t.name[group_name.len] == '.')
         {
             // Extract subcommand name (e.g., "view" from "secrets.view")
             const subname = t.name[prefix_with_dot_len..];
+
+            // Skip hidden subcommands (starting with _)
+            if (subname.len > 0 and subname[0] == '_') {
+                continue;
+            }
 
             // Only show immediate subcommands (no further dots)
             if (std.mem.indexOf(u8, subname, ".") == null) {

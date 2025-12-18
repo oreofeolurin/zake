@@ -398,13 +398,13 @@ pub const TaskRegistry = struct {
     /// 1. Exact OS match (e.g., arch:macos on macOS)
     /// 2. Category match (e.g., arch:unix on macOS)
     /// 3. Fallback to arch:any (no arch directive)
-    pub fn findTask(self: *TaskRegistry, name: []const u8) ?*Task {
+    pub fn findTask(self: *const TaskRegistry, name: []const u8) ?*const Task {
         const builtin = @import("builtin");
         const current_os = builtin.os.tag;
 
-        var exact_match: ?*Task = null;
-        var unix_match: ?*Task = null;
-        var any_match: ?*Task = null;
+        var exact_match: ?*const Task = null;
+        var unix_match: ?*const Task = null;
+        var any_match: ?*const Task = null;
 
         for (self.tasks.items) |*t| {
             const name_matches = std.mem.eql(u8, t.name, name) or blk: {

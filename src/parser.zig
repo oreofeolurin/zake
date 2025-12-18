@@ -31,6 +31,7 @@ pub const Parser = struct {
     multiline_silent: bool, // Whether current multi-line block is silent
     multiline_ignore_error: bool, // Whether current multi-line block ignores errors
     multiline_indent: usize, // Indentation level of multi-line content
+    multiline_marker: u8, // The marker that started this block (@ or $)
 
     pub fn init(allocator: Allocator) Parser {
         return Parser{
@@ -45,6 +46,7 @@ pub const Parser = struct {
             .multiline_silent = false,
             .multiline_ignore_error = false,
             .multiline_indent = 0,
+            .multiline_marker = 0,
         };
     }
 
@@ -81,6 +83,8 @@ pub const Parser = struct {
     /// Finalize a multi-line script block and add it to the current task
     fn finalizeMultilineBlock(self: *Parser) !void {
         if (self.state != .InMultilineScript or self.multiline_buffer.items.len == 0) {
+            self.state = .InScript;
+            self.multiline_marker = 0;
             return;
         }
 
@@ -98,15 +102,29 @@ pub const Parser = struct {
         self.multiline_silent = false;
         self.multiline_ignore_error = false;
         self.multiline_indent = 0;
+        self.multiline_marker = 0;
         self.state = .InScript;
     }
-
     /// Parse a single line
     fn parseLine(self: *Parser, line: []const u8) anyerror!void {
         const trimmed = std.mem.trim(u8, line, " \t\r");
 
         // Handle multi-line script accumulation
         if (self.state == .InMultilineScript) {
+            // Check for end marker: a line with just @ or $ (must be indented)
+            if (isIndented(line) and trimmed.len == 1 and (trimmed[0] == '@' or trimmed[0] == '$')) {
+                if (trimmed[0] == self.multiline_marker) {
+                    // Matching end marker found - finalize the block
+                    try self.finalizeMultilineBlock();
+                    return;
+                } else {
+                    // Mismatched marker - error
+                    const util = @import("util.zig");
+                    util.printError("Line {d}: Mismatched block marker. Block started with '{c}' but ended with '{c}'", .{ self.line_number, self.multiline_marker, trimmed[0] });
+                    return error.MismatchedBlockMarker;
+                }
+            }
+
             // Check if this line is still part of the multi-line block
             // Allow blank lines within the block
             if (trimmed.len == 0) {
@@ -478,7 +496,12 @@ pub const Parser = struct {
         }
 
         // Extract value
-        const value = std.mem.trim(u8, line[pos + op_len ..], " \t");
+        var value = std.mem.trim(u8, line[pos + op_len ..], " \t");
+
+        // Strip surrounding quotes if present
+        if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
+            value = value[1 .. value.len - 1];
+        }
 
         // Process $(VAR) references in the value
         const processed_value = try self.expandMakefileVars(value);
@@ -763,6 +786,7 @@ pub const Parser = struct {
                     self.state = .InMultilineScript;
                     self.multiline_silent = is_silent;
                     self.multiline_ignore_error = ignore_error;
+                    self.multiline_marker = '$'; // Track which marker started this block
                     // Calculate the indent level for content lines
                     // The content should be indented more than the current line
                     self.multiline_indent = getIndentLevel(original_line) + 4; // Expect content indented by 4 more spaces
@@ -781,6 +805,7 @@ pub const Parser = struct {
             self.state = .InMultilineScript;
             self.multiline_silent = true;
             self.multiline_ignore_error = false;
+            self.multiline_marker = '@'; // Track which marker started this block
             self.multiline_indent = getIndentLevel(original_line) + 4;
             return;
         }

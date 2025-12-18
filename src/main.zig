@@ -248,7 +248,7 @@ fn findZakefile(allocator: std.mem.Allocator) !FindResult {
 
 /// Result of task name resolution
 const ResolveResult = struct {
-    task: ?*task_mod.Task,
+    task: ?*const task_mod.Task,
     remaining_args: []const [:0]const u8,
 };
 
