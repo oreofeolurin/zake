@@ -45,10 +45,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_unit_tests.step);
 
     // Install to system PATH
-    // Default: /opt/homebrew/bin (Homebrew's bin directory, already in PATH on macOS)
+    // Default: /usr/local/bin on Linux, /opt/homebrew/bin on macOS
     // Override: zig build install-system -Dinstall_dir=~/.local/bin
     const install_dir_option = b.option([]const u8, "install_dir", "Directory to install zake binary");
-    const default_install_dir = "/opt/homebrew/bin";
+    const default_install_dir = if (b.graph.host.result.os.tag == .macos) "/opt/homebrew/bin" else "/usr/local/bin";
     const install_dir = install_dir_option orelse default_install_dir;
 
     const system_install_step = b.step("install-system", "Install zake to system PATH directory");
