@@ -681,6 +681,7 @@ pub const Parser = struct {
 
     /// Parse a flag definition
     /// Format: flag: --long-name|-s [type="default"] "description"
+    /// Or: flag: --long-name|-s [type?] "description" (optional, defaults to empty string)
     fn parseFlag(self: *Parser, line: []const u8) !void {
         const content = std.mem.trim(u8, line[5..], " \t"); // Skip "flag:"
 
@@ -710,9 +711,9 @@ pub const Parser = struct {
             }
         }
 
-        // Find [type="default"]
+        // Find [type="default"] or [type?]
         const type_start = std.mem.indexOf(u8, content[search_start..], "[") orelse {
-            std.debug.print("Error at line {d}: Flag missing [type=\"default\"]\n", .{self.line_number});
+            std.debug.print("Error at line {d}: Flag missing [type=\"default\"] or [type?]\n", .{self.line_number});
             return error.InvalidFlagSyntax;
         };
 
@@ -723,18 +724,26 @@ pub const Parser = struct {
 
         const type_section = content[search_start + type_start + 1 .. search_start + type_start + type_end];
 
-        // Parse type and default value (e.g., string="dev")
-        const equals_pos = std.mem.indexOf(u8, type_section, "=") orelse {
-            std.debug.print("Error at line {d}: Flag missing default value\n", .{self.line_number});
+        // Check if optional flag (e.g., [string?]) - no default value required
+        var default_value: []const u8 = "";
+        var type_str: []const u8 = undefined;
+
+        if (std.mem.indexOf(u8, type_section, "=")) |equals_pos| {
+            // Has default value: [string="value"]
+            type_str = std.mem.trim(u8, type_section[0..equals_pos], " \t");
+            default_value = std.mem.trim(u8, type_section[equals_pos + 1 ..], " \t");
+
+            // Remove quotes from default value
+            if (default_value.len >= 2 and default_value[0] == '"' and default_value[default_value.len - 1] == '"') {
+                default_value = default_value[1 .. default_value.len - 1];
+            }
+        } else if (std.mem.endsWith(u8, type_section, "?")) {
+            // Optional flag without default: [string?] - defaults to empty string
+            type_str = type_section[0 .. type_section.len - 1];
+        } else {
+            // Neither = nor ? - invalid
+            std.debug.print("Error at line {d}: Flag missing default value. Use [type=\"default\"] or [type?] for optional\n", .{self.line_number});
             return error.InvalidFlagSyntax;
-        };
-
-        const type_str = std.mem.trim(u8, type_section[0..equals_pos], " \t");
-        var default_value = std.mem.trim(u8, type_section[equals_pos + 1 ..], " \t");
-
-        // Remove quotes from default value
-        if (default_value.len >= 2 and default_value[0] == '"' and default_value[default_value.len - 1] == '"') {
-            default_value = default_value[1 .. default_value.len - 1];
         }
 
         // Parse type
