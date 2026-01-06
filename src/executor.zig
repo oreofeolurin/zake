@@ -240,9 +240,14 @@ fn evaluateSingleValue(allocator: Allocator, value: []const u8, vars: VarMap, re
         return executeZakeRun(allocator, trimmed, vars, registry, false);
     }
 
-    // Handle zake::exec() - executes task and captures stdout
-    if (std.mem.startsWith(u8, trimmed, "zake::exec(")) {
+    // Handle zake::call() - calls task and captures stdout
+    if (std.mem.startsWith(u8, trimmed, "zake::call(")) {
         return executeZakeRun(allocator, trimmed, vars, registry, true);
+    }
+
+    // Handle zake::exec() - executes shell command and captures output
+    if (std.mem.startsWith(u8, trimmed, "zake::exec(")) {
+        return executeZakeExec(allocator, trimmed, vars);
     }
 
     // Check if it's a stdlib call BEFORE substitution
@@ -272,49 +277,58 @@ fn evaluateSingleValue(allocator: Allocator, value: []const u8, vars: VarMap, re
 }
 
 /// Execute a task with given variable bindings
-/// Execute zake::run(task_name, args...) or zake::exec(task_name, args...)
+/// Execute zake::run(task_name, args...) or zake::call(task_name, args...)
 /// If capture_output is true, captures stdout; otherwise returns exit code
 fn executeZakeRun(allocator: Allocator, call: []const u8, vars: VarMap, registry: ?*const TaskRegistry, capture_output: bool) ![]const u8 {
-    _ = vars; // Not used for now, but could be used to pass variables
-
     if (registry == null) {
-        util.printError("zake::run requires registry context", .{});
+        util.printError("zake::run/call requires registry context", .{});
         return error.StdlibError;
     }
 
-    // Parse: zake::run(task_name, arg1, arg2, ...) or zake::exec(...)
-    const prefix = if (capture_output) "zake::exec(" else "zake::run(";
+    // Parse: zake::run(task_name, arg1, arg2, ...) or zake::call(...)
+    const prefix = if (capture_output) "zake::call(" else "zake::run(";
     if (!std.mem.startsWith(u8, call, prefix)) {
         return error.InvalidSyntax;
     }
 
     const close_paren = std.mem.lastIndexOf(u8, call, ")") orelse {
-        util.printError("zake::run: missing closing parenthesis", .{});
+        util.printError("zake::run/call: missing closing parenthesis", .{});
         return error.InvalidSyntax;
     };
 
     const args_str = call[prefix.len..close_paren];
 
     // Parse arguments (task name and optional args)
-    var args = stdlib.parseArgs(allocator, args_str) catch {
-        util.printError("zake::run: failed to parse arguments", .{});
+    var raw_args = stdlib.parseArgs(allocator, args_str) catch {
+        util.printError("zake::run/call: failed to parse arguments", .{});
         return error.InvalidSyntax;
     };
+    defer {
+        for (raw_args.items) |arg| allocator.free(arg);
+        raw_args.deinit(allocator);
+    }
+
+    if (raw_args.items.len == 0) {
+        util.printError("zake::run/call requires at least a task name", .{});
+        return error.InvalidSyntax;
+    }
+
+    // Resolve all arguments (task name and positional args) using vars map
+    var args: std.ArrayList([]const u8) = .empty;
     defer {
         for (args.items) |arg| allocator.free(arg);
         args.deinit(allocator);
     }
-
-    if (args.items.len == 0) {
-        util.printError("zake::run requires at least a task name", .{});
-        return error.InvalidSyntax;
+    for (raw_args.items) |raw_arg| {
+        const resolved = try stdlib.resolveArg(allocator, raw_arg, vars);
+        try args.append(allocator, resolved);
     }
 
     const task_name = args.items[0];
 
     // Find the task
     const task = registry.?.findTask(task_name) orelse {
-        util.printError("zake::run: task '{s}' not found", .{task_name});
+        util.printError("zake::run/call: task '{s}' not found", .{task_name});
         return error.TaskNotFound;
     };
 
@@ -329,22 +343,48 @@ fn executeZakeRun(allocator: Allocator, call: []const u8, vars: VarMap, registry
         task_vars.deinit();
     }
 
-    // Map positional arguments to task argument names
+    // First, copy global variables from the registry
+    var global_iter = registry.?.global_vars.iterator();
+    while (global_iter.next()) |entry| {
+        const key = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(key);
+        const val = try allocator.dupe(u8, entry.value_ptr.*);
+        try task_vars.put(key, val);
+    }
+
+    // Also copy caller's local variables (for nested calls)
+    var caller_iter = vars.iterator();
+    while (caller_iter.next()) |entry| {
+        // Don't overwrite if already set (globals take precedence from registry)
+        if (!task_vars.contains(entry.key_ptr.*)) {
+            const key = try allocator.dupe(u8, entry.key_ptr.*);
+            errdefer allocator.free(key);
+            const val = try allocator.dupe(u8, entry.value_ptr.*);
+            try task_vars.put(key, val);
+        }
+    }
+
+    // Map positional arguments to task argument names (overwrite any existing)
     var arg_idx: usize = 1; // Start after task name
     for (task.arguments.items) |task_arg| {
         if (arg_idx < args.items.len) {
             const key = try allocator.dupe(u8, task_arg.name);
             const val = try allocator.dupe(u8, args.items[arg_idx]);
+            // Remove old value if exists
+            if (task_vars.fetchRemove(task_arg.name)) |old| {
+                allocator.free(old.key);
+                allocator.free(old.value);
+            }
             try task_vars.put(key, val);
             arg_idx += 1;
         } else if (!task_arg.is_optional) {
-            util.printError("zake::run: missing required argument '{s}' for task '{s}'", .{ task_arg.name, task_name });
+            util.printError("zake::run/call: missing required argument '{s}' for task '{s}'", .{ task_arg.name, task_name });
             return error.MissingArgument;
         }
     }
 
     if (capture_output) {
-        // For run_capture, we execute the task's script and capture stdout
+        // For call, we execute the task's script and capture stdout
         // Build a shell script from the task's script lines and execute it
         return executeTaskCaptureOutput(allocator, task, task_vars, registry);
     } else {
@@ -357,7 +397,7 @@ fn executeZakeRun(allocator: Allocator, call: []const u8, vars: VarMap, registry
         }
 
         const exit_code = executeTaskInternal(allocator, task, task_vars, registry, 0, &completed) catch |err| {
-            util.printError("zake::run: task '{s}' failed: {s}", .{ task.name, @errorName(err) });
+            util.printError("zake::run/call: task '{s}' failed: {s}", .{ task.name, @errorName(err) });
             return error.TaskFailed;
         };
 
@@ -367,8 +407,77 @@ fn executeZakeRun(allocator: Allocator, call: []const u8, vars: VarMap, registry
     }
 }
 
+/// Execute zake::exec("shell command") - runs shell command and captures output
+fn executeZakeExec(allocator: Allocator, call: []const u8, vars: VarMap) ![]const u8 {
+    const prefix = "zake::exec(";
+    if (!std.mem.startsWith(u8, call, prefix)) {
+        return error.InvalidSyntax;
+    }
+
+    const close_paren = std.mem.lastIndexOf(u8, call, ")") orelse {
+        util.printError("zake::exec: missing closing parenthesis", .{});
+        return error.InvalidSyntax;
+    };
+
+    const args_str = call[prefix.len..close_paren];
+
+    // Parse the command argument
+    var args = stdlib.parseArgs(allocator, args_str) catch {
+        util.printError("zake::exec: failed to parse arguments", .{});
+        return error.InvalidSyntax;
+    };
+    defer {
+        for (args.items) |arg| allocator.free(arg);
+        args.deinit(allocator);
+    }
+
+    if (args.items.len == 0) {
+        util.printError("zake::exec requires a command string", .{});
+        return error.InvalidSyntax;
+    }
+
+    // Resolve the command argument (supports variables)
+    const raw_command = args.items[0];
+    const command = try stdlib.resolveArg(allocator, raw_command, vars);
+    defer allocator.free(command);
+
+    // Substitute variables in the command
+    const substituted_command = try substituteVariables(allocator, command, vars);
+    defer allocator.free(substituted_command);
+
+    // Execute the shell command and capture output
+    var child = std.process.Child.init(&[_][]const u8{ "/bin/sh", "-c", substituted_command }, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Inherit;
+
+    try child.spawn();
+
+    const output = try child.stdout.?.readToEndAlloc(allocator, 1024 * 1024); // 1MB max
+
+    const term = try child.wait();
+    if (term.Exited != 0) {
+        allocator.free(output);
+        util.printError("zake::exec: command failed with exit code {d}", .{term.Exited});
+        return error.CommandFailed;
+    }
+
+    // Trim trailing newline
+    var result = output;
+    while (result.len > 0 and (result[result.len - 1] == '\n' or result[result.len - 1] == '\r')) {
+        result = result[0 .. result.len - 1];
+    }
+
+    if (result.len != output.len) {
+        const trimmed = try allocator.dupe(u8, result);
+        allocator.free(output);
+        return trimmed;
+    }
+
+    return output;
+}
+
 /// Execute a task and capture its stdout output
-/// Used by zake::exec() to get output from tasks
+/// Used by zake::call() to get output from tasks
 fn executeTaskCaptureOutput(allocator: Allocator, task: *const Task, vars: VarMap, registry: ?*const TaskRegistry) ![]const u8 {
     _ = registry; // May be used for nested runs later
 

@@ -139,7 +139,7 @@ pub fn isStdlibCall(line: []const u8) bool {
 /// - Quoted strings ("value") -> return the literal value (without quotes)
 /// - Unquoted identifiers (varname) -> look up in vars map
 /// - If not found in vars, return as-is (might be a literal like a number)
-fn resolveArg(allocator: Allocator, raw_arg: []const u8, vars: VarMap) ![]const u8 {
+pub fn resolveArg(allocator: Allocator, raw_arg: []const u8, vars: VarMap) ![]const u8 {
     const trimmed = std.mem.trim(u8, raw_arg, " \t");
 
     // Quoted string - return literal (quotes already stripped by parseArgs for escaped strings)

@@ -1,0 +1,6 @@
+SUBFOLDER ?= "/examples"
+
+
+subfolder.hello:
+    script:
+        echo "Hello from build.zake! This is a subfolder task from {{SUBFOLDER}}"

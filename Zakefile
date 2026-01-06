@@ -1,10 +1,13 @@
 # Example Zakefile for Zake
-# import "build.zake"  # Uncomment if you have additional build tasks
+import "./examples/build.zake"
+
 
 # Global variables
 APP_NAME = my-awesome-app
+AWS_REGION = us-west-2
 VERSION = 1.0.0
 BUILD_DIR = dist
+GLOBAL_NUMBER = 10
 
 ## Build the project
 build:
@@ -228,7 +231,7 @@ _add:
     arg: <a> [string] "First number"
     arg: <b> [string] "Second number"
     script:
-        @expr {{a}} + {{b}}
+        @expr {{a}} + {{b}} + {{GLOBAL_NUMBER}}
 
 # Hidden helper - returns a value
 _get_greeting:
@@ -240,17 +243,27 @@ _get_greeting:
 test-run:
     script:
         echo "Testing zake::run..."
-        let result = zake::run("_greet", "World")
+        let task = _greet
+        let name = World
+        let result = zake::run(task, name)
         echo "Run result (exit code): {{result}}"
 
 ## Test zake::exec to capture output from a task
 test-exec:
     script:
-        echo "Testing zake::exec..."
-        let sum = zake::exec("_add", "5", "3")
-        echo "5 + 3 = {{sum}}"
-        let greeting = zake::exec("_get_greeting", "Alice")
+        @echo "Testing zake::call and zake::exec..."
+        let a = 5
+        let b = 3
+        let sum = zake::call(_add, a, b)
+        @echo "5 + 3 + 10 = {{sum}}"
+        let greeting = zake::call(_get_greeting, "Alice")
         echo "Greeting: {{greeting}}"
+        
+        # Test new zake::exec for shell commands
+        let current_dir = zake::exec("pwd")
+        echo "Current directory: {{current_dir}}"
+        let expr_result = zake::exec("expr 20 + 22")
+        echo "20 + 22 = {{expr_result}}"
 
 ## Test optional end marker for multi-line shell blocks
 test-endmarker:

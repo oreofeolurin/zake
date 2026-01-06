@@ -387,10 +387,21 @@ pub const TaskRegistry = struct {
     }
 
     pub fn addGlobalVar(self: *TaskRegistry, name: []const u8, value: []const u8) !void {
-        const key_copy = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(key_copy);
         const value_copy = try self.allocator.dupe(u8, value);
-        try self.global_vars.put(key_copy, value_copy);
+        errdefer self.allocator.free(value_copy);
+
+        const gop = try self.global_vars.getOrPut(name);
+        
+        if (gop.found_existing) {
+            // Key already exists - free the old value, keep the existing key
+            self.allocator.free(gop.value_ptr.*);
+            gop.value_ptr.* = value_copy;
+        } else {
+            // New key - need to allocate a copy of the key
+            const key_copy = try self.allocator.dupe(u8, name);
+            gop.key_ptr.* = key_copy;
+            gop.value_ptr.* = value_copy;
+        }
     }
 
     /// Find a task by name or alias. If multiple tasks with the same name exist

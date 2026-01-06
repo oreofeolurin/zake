@@ -434,17 +434,24 @@ pub const Parser = struct {
         imported_registry.tasks.clearAndFree(self.allocator);
 
         // Merge imported global variables
+        // Use addGlobalVar which properly duplicates keys/values
+        // This ensures consistent ownership semantics when variables are later overwritten
         var var_iter = imported_registry.global_vars.iterator();
         while (var_iter.next()) |entry| {
             if (!self.registry.global_vars.contains(entry.key_ptr.*)) {
-                const key_copy = try self.allocator.dupe(u8, entry.key_ptr.*);
-                errdefer self.allocator.free(key_copy);
-                const value_copy = try self.allocator.dupe(u8, entry.value_ptr.*);
-                try self.registry.global_vars.put(key_copy, value_copy);
+                // Add to registry (this duplicates the key/value)
+                try self.registry.addGlobalVar(entry.key_ptr.*, entry.value_ptr.*);
             }
         }
 
-        // Now safe to let sub_parser deinit - tasks have been moved out
+        // Explicitly deinit imported_registry's global_vars (parse() returned ownership to us)
+        // sub_parser.deinit() only cleans up sub_parser.registry, which is now empty
+        var cleanup_iter = imported_registry.global_vars.iterator();
+        while (cleanup_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        imported_registry.global_vars.deinit();
     }
 
     /// Try to parse Makefile-style variable assignment
