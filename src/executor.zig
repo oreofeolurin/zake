@@ -380,6 +380,11 @@ fn executeZakeRun(allocator: Allocator, call: []const u8, vars: VarMap, registry
         } else if (!task_arg.is_optional) {
             util.printError("zake::run/call: missing required argument '{s}' for task '{s}'", .{ task_arg.name, task_name });
             return error.MissingArgument;
+        } else {
+            // Optional arg not provided — use default value
+            const key = try allocator.dupe(u8, task_arg.name);
+            const val = try allocator.dupe(u8, task_arg.default_value);
+            try task_vars.put(key, val);
         }
     }
 

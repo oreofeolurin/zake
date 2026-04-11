@@ -228,19 +228,22 @@ pub const Argument = struct {
     name: []const u8,
     arg_type: ArgType,
     is_optional: bool,
+    default_value: []const u8,
     description: ?[]const u8,
 
-    pub fn init(allocator: Allocator, name: []const u8, arg_type: ArgType, is_optional: bool, description: ?[]const u8) !Argument {
+    pub fn init(allocator: Allocator, name: []const u8, arg_type: ArgType, is_optional: bool, default_value: []const u8, description: ?[]const u8) !Argument {
         return Argument{
             .name = try allocator.dupe(u8, name),
             .arg_type = arg_type,
             .is_optional = is_optional,
+            .default_value = try allocator.dupe(u8, default_value),
             .description = if (description) |desc| try allocator.dupe(u8, desc) else null,
         };
     }
 
     pub fn deinit(self: *Argument, allocator: Allocator) void {
         allocator.free(self.name);
+        allocator.free(self.default_value);
         if (self.description) |desc| {
             allocator.free(desc);
         }
@@ -391,7 +394,7 @@ pub const TaskRegistry = struct {
         errdefer self.allocator.free(value_copy);
 
         const gop = try self.global_vars.getOrPut(name);
-        
+
         if (gop.found_existing) {
             // Key already exists - free the old value, keep the existing key
             self.allocator.free(gop.value_ptr.*);

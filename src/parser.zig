@@ -650,9 +650,26 @@ pub const Parser = struct {
 
         const type_section = content[start_bracket + end_bracket + type_start + 1 .. start_bracket + end_bracket + type_start + type_end];
 
-        // Check if optional (ends with ?)
-        const is_optional = std.mem.endsWith(u8, type_section, "?");
-        const type_str = if (is_optional) type_section[0 .. type_section.len - 1] else type_section;
+        // Parse type section: [string], [string?], or [string="default"]
+        var default_value: []const u8 = "";
+        var is_optional = false;
+        var type_str: []const u8 = undefined;
+
+        if (std.mem.indexOf(u8, type_section, "=")) |equals_pos| {
+            // Has default value: [string="value"] — implicitly optional
+            type_str = std.mem.trim(u8, type_section[0..equals_pos], " \t");
+            is_optional = true;
+            var dv = std.mem.trim(u8, type_section[equals_pos + 1 ..], " \t");
+            if (dv.len >= 2 and dv[0] == '"' and dv[dv.len - 1] == '"') {
+                dv = dv[1 .. dv.len - 1];
+            }
+            default_value = dv;
+        } else if (std.mem.endsWith(u8, type_section, "?")) {
+            type_str = type_section[0 .. type_section.len - 1];
+            is_optional = true;
+        } else {
+            type_str = type_section;
+        }
 
         // Parse type (currently only "string" supported)
         const arg_type = if (std.mem.eql(u8, type_str, "string"))
@@ -667,7 +684,7 @@ pub const Parser = struct {
         const description = extractDescription(after_type);
 
         // Create argument
-        const arg = try Argument.init(self.allocator, arg_name, arg_type, is_optional, description);
+        const arg = try Argument.init(self.allocator, arg_name, arg_type, is_optional, default_value, description);
         try self.current_task.?.addArgument(arg);
     }
 

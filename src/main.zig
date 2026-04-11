@@ -438,11 +438,11 @@ fn parseTaskArgs(
         }
     }
 
-    // Set empty string for optional arguments that weren't provided
+    // Set default values for optional arguments that weren't provided
     for (task.arguments.items, 0..) |task_arg, idx| {
         if (task_arg.is_optional and idx >= arg_index) {
             const key = try allocator.dupe(u8, task_arg.name);
-            const value = try allocator.dupe(u8, "");
+            const value = try allocator.dupe(u8, task_arg.default_value);
             try vars.put(key, value);
         }
     }
