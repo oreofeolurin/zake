@@ -54,3 +54,19 @@ pub fn getShell() struct { []const []const u8 } {
 pub fn isTTY() bool {
     return std.io.getStdOut().isTty();
 }
+
+/// Cross-platform environment variable lookup.
+/// Returns an allocated copy of the value, or null if not set.
+/// Caller is responsible for freeing the returned slice.
+pub fn lookupEnvVar(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
+    if (comptime builtin.os.tag == .windows) {
+        return std.process.getEnvVarOwned(allocator, name) catch null;
+    } else {
+        var name_buf: [4096]u8 = undefined;
+        if (name.len >= name_buf.len) return null;
+        @memcpy(name_buf[0..name.len], name);
+        name_buf[name.len] = 0;
+        const val = std.posix.getenv(name_buf[0..name.len :0]) orelse return null;
+        return allocator.dupe(u8, val) catch null;
+    }
+}

@@ -930,16 +930,9 @@ pub fn substituteVariables(gpa: Allocator, template: []const u8, vars: VarMap) !
             const var_name = template[i + 2 .. i + 2 + close_pos];
 
             // First check VarMap, then fall back to environment variable
-            const value = vars.get(var_name) orelse blk: {
-                // Check environment variable as fallback
-                var env_name_buf: [256]u8 = undefined;
-                if (var_name.len < 256) {
-                    @memcpy(env_name_buf[0..var_name.len], var_name);
-                    env_name_buf[var_name.len] = 0;
-                    break :blk std.posix.getenv(env_name_buf[0..var_name.len :0]) orelse "";
-                }
-                break :blk "";
-            };
+            const env_val_opt = if (vars.get(var_name) == null) util.lookupEnvVar(gpa, var_name) else null;
+            defer if (env_val_opt) |ev| gpa.free(ev);
+            const value = vars.get(var_name) orelse (env_val_opt orelse "");
 
             try result.appendSlice(gpa, value);
             i = i + 2 + close_pos + 2;
@@ -955,15 +948,13 @@ pub fn substituteVariables(gpa: Allocator, template: []const u8, vars: VarMap) !
 
             const var_name = template[i + 2 .. i + 2 + close_pos];
 
-            // Get environment variable (allocate temporary buffer for the name)
-            var env_name_buf: [256]u8 = undefined;
             if (var_name.len >= 256) {
                 return error.EnvVarNameTooLong;
             }
-            @memcpy(env_name_buf[0..var_name.len], var_name);
-            env_name_buf[var_name.len] = 0;
 
-            const env_value = std.posix.getenv(env_name_buf[0..var_name.len :0]) orelse "";
+            const env_value_opt = util.lookupEnvVar(gpa, var_name);
+            defer if (env_value_opt) |ev| gpa.free(ev);
+            const env_value = env_value_opt orelse "";
 
             try result.appendSlice(gpa, env_value);
             i = i + 2 + close_pos + 1;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const util = @import("util.zig");
 const main_mod = @import("main.zig");
 const Allocator = std.mem.Allocator;
@@ -498,14 +499,9 @@ fn executeSys(allocator: Allocator, function: []const u8, args: []const []const 
         const default_value = if (args.len >= 2) args[1] else "";
 
         // Get environment variable
-        var env_name_buf: [256]u8 = undefined;
-        if (var_name.len >= 256) {
-            return StdlibResult{ .err = "sys.env: variable name too long" };
-        }
-        @memcpy(env_name_buf[0..var_name.len], var_name);
-        env_name_buf[var_name.len] = 0;
-
-        const env_value = std.posix.getenv(env_name_buf[0..var_name.len :0]) orelse default_value;
+        const env_value_opt = util.lookupEnvVar(allocator, var_name);
+        defer if (env_value_opt) |ev| allocator.free(ev);
+        const env_value = env_value_opt orelse default_value;
         const result = allocator.dupe(u8, env_value) catch return StdlibResult{ .err = "sys.env allocation failed" };
         return StdlibResult{ .string = result };
     } else {
@@ -563,6 +559,27 @@ fn executeIo(allocator: Allocator, function: []const u8, args: []const []const u
         // Disable echo for password input
         const stdin_file = std.fs.File.stdin();
         const stdin_fd = stdin_file.handle;
+
+        if (comptime builtin.os.tag == .windows) {
+            // Windows: use Console API to disable echo
+            const ENABLE_ECHO_INPUT: std.os.windows.DWORD = 0x0004;
+            var original_mode: std.os.windows.DWORD = undefined;
+            const got_mode = std.os.windows.kernel32.GetConsoleMode(stdin_fd, &original_mode) != 0;
+            if (got_mode) {
+                _ = std.os.windows.kernel32.SetConsoleMode(stdin_fd, original_mode & ~ENABLE_ECHO_INPUT);
+            }
+            var buf: [4096]u8 = undefined;
+            const line = readLineFromStdin(&buf) catch blk: {
+                if (got_mode) _ = std.os.windows.kernel32.SetConsoleMode(stdin_fd, original_mode);
+                _ = stdout_file.write("\n") catch {};
+                break :blk "";
+            };
+            if (got_mode) _ = std.os.windows.kernel32.SetConsoleMode(stdin_fd, original_mode);
+            _ = stdout_file.write("\n") catch {};
+            const result = allocator.dupe(u8, line) catch return StdlibResult{ .err = "io.prompt_secret allocation failed" };
+            return StdlibResult{ .string = result };
+        }
+
         var termios = std.posix.tcgetattr(stdin_fd) catch {
             // Fallback to regular input if terminal control not available
             var buf: [4096]u8 = undefined;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const util = @import("util.zig");
 const task = @import("task.zig");
 const Task = task.Task;
 const Argument = task.Argument;
@@ -119,7 +120,6 @@ pub const Parser = struct {
                     return;
                 } else {
                     // Mismatched marker - error
-                    const util = @import("util.zig");
                     util.printError("Line {d}: Mismatched block marker. Block started with '{c}' but ended with '{c}'", .{ self.line_number, self.multiline_marker, trimmed[0] });
                     return error.MismatchedBlockMarker;
                 }
@@ -521,13 +521,9 @@ pub const Parser = struct {
                 return true; // Already defined in Zakefile, skip
             }
             // Check environment variable
-            var env_name_buf: [256]u8 = undefined;
-            if (var_name.len < 256) {
-                @memcpy(env_name_buf[0..var_name.len], var_name);
-                env_name_buf[var_name.len] = 0;
-                if (std.posix.getenv(env_name_buf[0..var_name.len :0]) != null) {
-                    return true; // Already defined in environment, skip
-                }
+            if (util.lookupEnvVar(self.allocator, var_name)) |val| {
+                self.allocator.free(val);
+                return true; // Already defined in environment, skip
             }
         }
 
@@ -561,13 +557,9 @@ pub const Parser = struct {
                     try result.appendSlice(self.allocator, var_value);
                 } else {
                     // Check environment variable as fallback
-                    var env_name_buf: [256]u8 = undefined;
-                    if (var_ref.len < 256) {
-                        @memcpy(env_name_buf[0..var_ref.len], var_ref);
-                        env_name_buf[var_ref.len] = 0;
-                        if (std.posix.getenv(env_name_buf[0..var_ref.len :0])) |env_val| {
-                            try result.appendSlice(self.allocator, env_val);
-                        }
+                    if (util.lookupEnvVar(self.allocator, var_ref)) |env_val| {
+                        defer self.allocator.free(env_val);
+                        try result.appendSlice(self.allocator, env_val);
                         // If not found, leave empty (like Make)
                     }
                 }
