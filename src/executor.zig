@@ -451,7 +451,12 @@ fn executeZakeExec(allocator: Allocator, call: []const u8, vars: VarMap) ![]cons
     defer allocator.free(substituted_command);
 
     // Execute the shell command and capture output
-    var child = std.process.Child.init(&[_][]const u8{ "/bin/sh", "-c", substituted_command }, allocator);
+    const shell = getShellArgs();
+    var exec_argv: ArrayList([]const u8) = .empty;
+    defer exec_argv.deinit(allocator);
+    for (shell) |arg| try exec_argv.append(allocator, arg);
+    try exec_argv.append(allocator, substituted_command);
+    var child = std.process.Child.init(exec_argv.items, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Inherit;
 
@@ -1008,8 +1013,7 @@ pub fn executeShellCommand(allocator: Allocator, command: []const u8, echo: bool
     var argv: ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
 
-    try argv.append(allocator, shell[0]);
-    try argv.append(allocator, shell[1]);
+    for (shell) |arg| try argv.append(allocator, arg);
     try argv.append(allocator, command);
 
     var child = std.process.Child.init(argv.items, allocator);
@@ -1034,8 +1038,7 @@ fn executeShellCommandCapture(allocator: Allocator, command: []const u8) ![]u8 {
     var argv: ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
 
-    try argv.append(allocator, shell[0]);
-    try argv.append(allocator, shell[1]);
+    for (shell) |arg| try argv.append(allocator, arg);
     try argv.append(allocator, command);
 
     var child = std.process.Child.init(argv.items, allocator);
@@ -1055,9 +1058,9 @@ fn executeShellCommandCapture(allocator: Allocator, command: []const u8) ![]u8 {
 }
 
 /// Get shell command arguments for the current platform
-fn getShellArgs() [2][]const u8 {
+fn getShellArgs() []const []const u8 {
     return if (builtin.os.tag == .windows)
-        [_][]const u8{ "cmd.exe", "/C" }
+        &[_][]const u8{ "powershell.exe", "-NoProfile", "-Command" }
     else
-        [_][]const u8{ "sh", "-c" };
+        &[_][]const u8{ "sh", "-c" };
 }

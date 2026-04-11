@@ -45,7 +45,7 @@ pub fn printWarning(comptime fmt: []const u8, args: anytype) void {
 /// Get the appropriate shell for the current platform
 pub fn getShell() struct { []const []const u8 } {
     return if (builtin.os.tag == .windows)
-        .{&[_][]const u8{ "cmd.exe", "/C" }}
+        .{&[_][]const u8{ "powershell.exe", "-NoProfile", "-Command" }}
     else
         .{&[_][]const u8{ "sh", "-c" }};
 }
